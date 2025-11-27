@@ -3,7 +3,7 @@
 Copyright (C) 2025 Jacob Scow
 
 This project is licensed under the GNU General Public License v3.0 or later.  
-See the `LICENSE.txt` file for details.
+See the `LICENSE` file for details.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -131,3 +131,4 @@ bugs, and licensing of this repository rests with me, not the AI.
 This is a “works on my machine, generated with AI (+ human prodding)” project.
 Expect bugs, weird edge cases, and rough edges. Even though I don't seem to
 experience any myself when running it on my machine.
+
