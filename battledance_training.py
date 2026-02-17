@@ -5,58 +5,22 @@
 # it under the terms of the GNU General Public License version 3 or
 # later as published by the Free Software Foundation.
 #
-# See the LICENSE file in the project root for details.
+# See the LICENSE.txt file in the project root for details.
 
 # Jacob Scow, a.k.a., RadiantDarkBlaze
 
 r"""
-Battledance Chess training program
-================================
+Battledance Chess training program.
 
-This module implements a self-play training framework for the
-Battledance Chess variant.  The code follows a detailed
-specification that defines the game rules, a neural network
-evaluation model, a population-based evolutionary training scheme,
-snapshot semantics, and champion evaluation.  It is intended to run
-locally (using one or several worker processes) and saves all state
-to disk so training can be resumed between runs.
+Implements a self-play training framework for the Battledance Chess variant:
+- Full rules engine (custom leap/slide pieces, drops, threefold, 64-move, long-game cap).
+- State encoding: 594-dim float feature vector.
+- Evaluator: 3-hidden-layer tanh MLP (512 wide), scalar output.
+- Population-based neuroevolution (260 nets), selection/crossover/mutation.
+- Snapshot semantics: four slots per agent (_0.._3), parents/champions across cycles.
+- Per-cycle resumability via progress JSONs; per-agent champion evaluation logs.
 
-Key features:
-
-* Implements the full rules of Battledance Chess, including custom
-  leap and slide pieces, drop rules, and draw conditions (threefold
-  repetition, 64-move rule, and a long game cap).
-* Encodes the game state as a 594-dimensional feature vector and
-  evaluates positions using a three-layer tanh MLP.
-* Uses a neuro-evolution regimen: a population of 260 networks is
-  evolved via selection, crossover and mutation until eight parents
-  meet a win-rate threshold against frozen opponent snapshots.
-* Maintains four snapshots per agent (\_0..\_3) with strict
-  semantics for parents and champions across cycles.
-* After each agent finishes training in a cycle, its champion plays
-  evaluation games against opponent champions and logs the results.
-* After all agents finish training in a cycle, snapshots are rotated
-  and a new population is seeded from the latest parents.
-
-Note: This implementation prioritises correctness and adherence to
-the specification over runtime performance.  Running this program
-will require significant computation time.
-
-This project is licensed under the GNU General Public License v3.0 or later.
-See the `LICENSE.txt` file for details.
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+Licensed under GPL-3.0-or-later. See LICENSE.txt.
 """
 
 import os
@@ -68,10 +32,120 @@ import hashlib
 import time
 import argparse
 import multiprocessing
+import threading
+import queue
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
+###############################################################################
+#  Graceful stop (main-process keypress + cross-process stop event)
+###############################################################################
+
+class GracefulStop(Exception):
+    """Raised to request a clean stop at the next safe checkpoint."""
+    pass
+
+
+def check_stop(stop_event, *, ga_progress: Optional[Dict] = None) -> None:
+    """
+    If stop_event is set, raise GracefulStop.
+
+    If ga_progress is provided, attempt one final durable write of the current
+    GA progress before raising (best-effort).
+    """
+    if stop_event is None:
+        return
+    try:
+        is_set = stop_event.is_set()
+    except Exception:
+        return
+    if not is_set:
+        return
+
+    # Best-effort: force a durable GA progress checkpoint on stop.
+    if ga_progress is not None:
+        try:
+            path = _ga_progress_path()
+            if path:
+                _safe_write_json(path, ga_progress, indent=2, durable=True)
+        except Exception:
+            pass
+
+    raise GracefulStop()
+
+
+def start_stop_listener(stop_event) -> threading.Thread:
+    """
+    Start a daemon thread in the main process that listens for a keypress to
+    request a graceful stop. On Windows it listens for 'q' without Enter using
+    msvcrt; otherwise it falls back to reading a line ('q' + Enter).
+    """
+    def _thread() -> None:
+        # Prefer Windows non-blocking keypress (no Enter).
+        try:
+            import msvcrt  # type: ignore
+            log("[global] Press 'q' to request graceful stop (finish current game, save, exit).")
+            while not stop_event.is_set():
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch and ch.lower() == "q":
+                        stop_event.set()
+                        log("[global] Graceful stop requested (q).")
+                        return
+                time.sleep(0.1)
+            return
+        except Exception:
+            pass
+
+        # Portable fallback: requires Enter.
+        try:
+            log("[global] Type 'q' + Enter to request graceful stop (finish current game, save, exit).")
+            while not stop_event.is_set():
+                line = sys.stdin.readline()
+                if not line:
+                    return
+                if line.strip().lower() in ("q", "quit", "stop"):
+                    stop_event.set()
+                    log("[global] Graceful stop requested (stdin).")
+                    return
+        except Exception:
+            return
+
+    t = threading.Thread(target=_thread, daemon=True)
+    t.start()
+    return t
+
+
+def install_sigint_as_graceful(stop_event) -> None:
+    """
+    Convert the first Ctrl+C into a graceful stop request; a second Ctrl+C
+    triggers the normal KeyboardInterrupt.
+    """
+    try:
+        import signal
+    except Exception:
+        return
+
+    try:
+        old_handler = signal.getsignal(signal.SIGINT)
+    except Exception:
+        old_handler = None
+
+    def _handler(sig, frame):
+        if not stop_event.is_set():
+            stop_event.set()
+            log("[global] Ctrl+C received -> graceful stop requested. Press Ctrl+C again to force.")
+        else:
+            if callable(old_handler):
+                old_handler(sig, frame)
+            raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        return
+
 
 ###############################################################################
 #  Simple file-based training log
@@ -81,67 +155,126 @@ LOG_PATH: Optional[str] = None
 CURRENT_AGENT_NAME: str = ""
 CURRENT_GEN: int = 0
 CURRENT_CYCLE: int = 0
-
+STATUS_QUEUE: Optional[object] = None
+LOG_QUEUE: Optional[object] = None
 
 def setup_logging(base_dir: str, cycle: int) -> None:
-    """
-    Initialise global log file for this run. Appends a session header to
-    models/training_log.txt. Safe to call multiple times; only the first
-    call in a process sets LOG_PATH.
-    """
     global LOG_PATH, CURRENT_CYCLE
     CURRENT_CYCLE = cycle
     if LOG_PATH is None:
-        os.makedirs(base_dir, exist_ok=True)
-        LOG_PATH = os.path.join(base_dir, "training_log.txt")
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"\n=== New session cycle={cycle} started {ts} ===\n")
-
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+            LOG_PATH = os.path.join(base_dir, "training_log.txt")
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"\n=== New session cycle={cycle} started {ts} ===\n")
+        except Exception:
+            LOG_PATH = None
+            # swallow: logging must never crash training
+            pass
 
 def log(msg: str, also_print: bool = True) -> None:
     """
     Append a timestamped line to the log file and optionally echo to stdout.
-    Logging must never crash training; I/O errors are swallowed.
+    In multi-process mode, printing is performed only by the main log consumer.
     """
+    # Only suppress printing if someone configured status redirection WITHOUT log redirection.
+    # (If LOG_QUEUE is active, printing is safe: it happens in the main consumer.)
+    if STATUS_QUEUE is not None and LOG_QUEUE is None:
+        also_print = False
+
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     line = f"[{ts}] {msg}"
+
+    if LOG_QUEUE is not None:
+        try:
+            LOG_QUEUE.put_nowait((os.getpid(), line, bool(also_print)))
+        except Exception:
+            pass
+        return
+
     if also_print:
         print(line, flush=True)
+
     if LOG_PATH is not None:
         try:
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
-            # Logging must never crash training
             pass
 
 _last_status_len: int = 0
+
+_status_active: bool = False
+
+def init_ipc(status_queue: Optional[object], log_queue: Optional[object]) -> None:
+    """
+    Called inside worker processes to redirect status() and log() updates
+    to the main process.
+    """
+    global STATUS_QUEUE, LOG_QUEUE
+    STATUS_QUEUE = status_queue
+    LOG_QUEUE = log_queue
+
+def status_newline() -> None:
+    """
+    End the current status line with a newline.
+
+    In multi-process mode (STATUS_QUEUE set), this sends a newline request
+    to the main process. Otherwise it prints locally.
+
+    IMPORTANT: this is a no-op if this process has not emitted any status()
+    updates since the last status_newline(). This prevents stray blank lines
+    when a phase completes without printing a status bar.
+    """
+    global _last_status_len, _status_active
+
+    if not _status_active and _last_status_len == 0:
+        return
+
+    if STATUS_QUEUE is not None:
+        try:
+            # msg=None is treated as "print newline" by the main consumer.
+            STATUS_QUEUE.put_nowait((os.getpid(), None))
+        except Exception:
+            pass
+    else:
+        print()
+
+    _last_status_len = 0
+    _status_active = False
 
 
 def status(msg: str) -> None:
     """
     Update a single carriage-return status line on the console.
 
-    Uses only '\r' and spaces (no ANSI escape sequences), so it behaves
-    sensibly on plain Windows consoles. Nothing from here is written to
-    the log file.
+    In multi-process modes, workers push status updates to the main process
+    through STATUS_QUEUE so only one writer touches stdout (prevents smear).
     """
-    global _last_status_len
-    line = msg[:200]  # cap length to something sane
+    line = (msg or "")[:200]  # cap length to something sane
 
-    # Move cursor to column 0 and write the new text
+    global _status_active
+    _status_active = True
+
+    # Worker redirection path
+    if STATUS_QUEUE is not None:
+        try:
+            STATUS_QUEUE.put_nowait((os.getpid(), line))
+        except Exception:
+            pass
+        return
+
+    # Single-process path (original behavior)
+    global _last_status_len
     sys.stdout.write("\r" + line)
 
-    # If the previous line was longer, overwrite the tail with spaces
     if _last_status_len > len(line):
         sys.stdout.write(" " * (_last_status_len - len(line)))
-        # Move back to start and re-write the new line (so we don't end on spaces)
         sys.stdout.write("\r" + line)
 
     sys.stdout.flush()
     _last_status_len = len(line)
-
 
 ###############################################################################
 #  Cycle progress tracking (for resumability)
@@ -152,121 +285,51 @@ def load_cycle_progress(
     cycle: int,
     agent_names: List[str],
 ) -> Dict:
-    """
-    Load or initialise per-cycle, per-agent progress.
-
-    Layout of cycle_progress.json:
-
-    {
-      "cycle": <int>,
-      "agents": {
-        "Red": {"state": "pending"|"done", "last_gen": <int>, "last_cycle": <int>},
-        ...
-      }
-    }
-
-    Semantics:
-      * "pending": GA training and champion matches for this agent in this
-        cycle have not been completed (or must be redone).
-      * "done": GA training and champion matches completed for this agent
-        in this cycle.
-
-    Any legacy or unknown state values are treated as "pending" by the
-    caller.
-    """
     path = os.path.join(base_dir, "cycle_progress.json")
-    data: Dict[str, object]
-
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    else:
+    data = _safe_read_json(path)
+    if not isinstance(data, dict):
         data = {}
 
     if data.get("cycle") != cycle:
-        # New cycle or corrupted file; start fresh.
         agents_progress: Dict[str, Dict[str, object]] = {}
     else:
         agents_progress = data.get("agents", {}) or {}
+        if not isinstance(agents_progress, dict):
+            agents_progress = {}
 
-    # Ensure every agent has at least a stub entry.
     for name in agent_names:
-        if name not in agents_progress:
+        if name not in agents_progress or not isinstance(agents_progress.get(name), dict):
             agents_progress[name] = {"state": "pending"}
 
     return {"cycle": cycle, "agents": agents_progress}
 
-
 def save_cycle_progress(base_dir: str, progress: Dict) -> None:
     """
-    Persist the current per-cycle, per-agent progress state.
-
-    I/O errors are swallowed to avoid crashing training.
+    Persist the current per-cycle, per-agent progress state atomically.
     """
     path = os.path.join(base_dir, "cycle_progress.json")
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(progress, f, indent=2)
+        _safe_write_json(path, progress, indent=2, durable=True)
     except Exception:
-        # Progress logging must not crash training.
         pass
 
 def load_champion_progress(base_dir: str, cycle: int, name: str) -> Dict:
-    """
-    Load or initialise per-cycle champion-match progress for a single agent.
-
-    Layout of champion_progress_<name>.json:
-
-    {
-      "cycle": <int>,
-      "next_index": <int>
-    }
-
-    Semantics:
-      * next_index = number of champion-match games already completed
-        for this agent in this cycle (0-based; games [0..next_index-1]
-        are considered done).
-    """
     path = os.path.join(base_dir, f"champion_progress_{name}.json")
-    data: Dict[str, object]
-
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    else:
-        data = {}
-
-    if data.get("cycle") != cycle:
-        # New cycle or corrupted file; start fresh for this agent.
+    data = _safe_read_json(path)
+    if not isinstance(data, dict) or data.get("cycle") != cycle:
         return {"cycle": cycle, "next_index": 0}
 
-    # Ensure next_index is sane
     next_index = data.get("next_index", 0)
     if not isinstance(next_index, int):
         next_index = 0
     data["next_index"] = int(next_index)
     return data
 
-
 def save_champion_progress(base_dir: str, name: str, progress: Dict) -> None:
-    """
-    Persist per-cycle champion-match progress state for a single agent.
-
-    I/O errors are swallowed to avoid crashing training.
-    """
     path = os.path.join(base_dir, f"champion_progress_{name}.json")
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(progress, f, indent=2)
+        _safe_write_json(path, progress, indent=2, durable=True)
     except Exception:
-        # Progress logging must not crash training.
         pass
 
 ###############################################################################
@@ -287,38 +350,20 @@ def _ga_progress_path() -> Optional[str]:
 
 
 def load_ga_progress() -> Optional[Dict]:
-    """
-    Load GA progress JSON for the current agent, or None if unavailable.
-
-    This file tracks per-generation GA evaluation progress so that at most
-    one in-progress Battledance game needs to be replayed after interruption.
-    """
     path = _ga_progress_path()
-    if not path or not os.path.exists(path):
+    if not path:
         return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
-    except Exception:
-        return None
-
+    data = _safe_read_json(path)
+    return data if isinstance(data, dict) else None
 
 def save_ga_progress(progress: Dict) -> None:
-    """
-    Persist GA progress JSON. I/O errors are swallowed; failure here must
-    never crash training.
-    """
     path = _ga_progress_path()
     if not path:
         return
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(progress, f, indent=2)
+        _safe_write_json(path, progress, indent=2, durable=False)
     except Exception:
         pass
-
 
 def reset_ga_progress() -> None:
     """
@@ -345,39 +390,12 @@ def _ga_done_file(base_dir: str, name: str) -> str:
     """
     return os.path.join(base_dir, f"ga_done_{name}.json")
 
-
 def load_ga_done_state(base_dir: str, name: str) -> Optional[Dict[str, object]]:
-    """
-    Load the GA 'done' marker for this agent, or None if absent/invalid.
-
-    Layout:
-
-      {
-        "cycle": <int>,
-        "agent": <str>,
-        "last_gen": <int>,
-        "timestamp": <str>
-      }
-    """
     path = _ga_done_file(base_dir, name)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return None
-        return data
-    except Exception:
-        return None
-
+    data = _safe_read_json(path)
+    return data if isinstance(data, dict) else None
 
 def save_ga_done_state(base_dir: str, name: str, cycle: int, last_gen: int) -> None:
-    """
-    Persist a GA 'done' marker for this agent and cycle.
-
-    I/O errors are swallowed to avoid crashing training.
-    """
     path = _ga_done_file(base_dir, name)
     payload = {
         "cycle": int(cycle),
@@ -386,13 +404,81 @@ def save_ga_done_state(base_dir: str, name: str, cycle: int, last_gen: int) -> N
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        _safe_write_json(path, payload, indent=2, durable=True)
     except Exception:
-        # Marker is purely an optimisation; never crash training.
         pass
 
+def _atomic_write_bytes(path: str, payload: bytes, *, make_backup: bool = True, durable: bool = True) -> None:
+    """
+    Write bytes atomically:
+      - write to a temp file in the same directory
+      - flush (+ optional fsync)
+      - optionally copy existing target to .bak (best effort)
+      - os.replace temp -> target (atomic on Windows/POSIX)
+
+    If anything fails, the existing target is left untouched.
+    """
+    dirpath = os.path.dirname(path) or "."
+    os.makedirs(dirpath, exist_ok=True)
+
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+            f.flush()
+            if durable:
+                os.fsync(f.fileno())
+
+        if make_backup and os.path.exists(path):
+            try:
+                # Best-effort backup; do not remove/rename the live file.
+                import shutil
+                shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
+
+        os.replace(tmp, path)  # atomic replace
+    finally:
+        # Clean up temp if it still exists
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _safe_write_json(path: str, obj: object, *, indent: int = 2, durable: bool = True) -> None:
+    payload = json.dumps(obj, indent=indent).encode("utf-8")
+    _atomic_write_bytes(path, payload, make_backup=True, durable=durable)
+
+
+def _safe_write_pickle(path: str, obj: object, *, durable: bool = True) -> None:
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    _atomic_write_bytes(path, payload, make_backup=True, durable=durable)
+
+
+def _safe_read_json(path: str) -> Optional[object]:
+    for p in (path, path + ".bak"):
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return None
+
+
+def _safe_read_pickle(path: str) -> Optional[object]:
+    for p in (path, path + ".bak"):
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            continue
+    return None
 
 ###############################################################################
 #  Game representation
@@ -402,6 +488,7 @@ def save_ga_done_state(base_dir: str, name: str, cycle: int, last_gen: int) -> N
 PIECE_ORDER: List[str] = ['K', 'N', 'F', 'L', 'P', 'G', 'R', 'B']
 PIECE_INDEX: Dict[str, int] = {k: i for i, k in enumerate(PIECE_ORDER)}
 IN_HAND_TYPES: List[str] = ['K', 'N', 'F', 'L', 'P', 'G', 'R']
+HAND_INDEX: Dict[str, int] = {k: i for i, k in enumerate(IN_HAND_TYPES)}  # K N F L P G R
 FEATURE_PLANES = 9 * 8 * 8  # 9 planes × 8×8
 FEATURE_TOTAL = FEATURE_PLANES + 14 + 4  # board + in-hand + scalars = 594
 
@@ -433,6 +520,34 @@ class Move:
     to_pos: Tuple[int, int]
     drop_type: Optional[str] = None
 
+@dataclass(slots=True)
+class _UndoFull:
+    prev_turn: str
+    prev_plys_since_capture_or_drop: int
+    prev_plys_since_game_start: int
+    prev_last_rep_key: Optional[str]
+
+    move: Move
+    moved_piece: Optional['Piece']          # None for drop
+    captured_piece: Optional['Piece']       # only for normal moves
+
+    # Drop undo (restore removed hand piece at exact index)
+    drop_removed_index: Optional[int]       # only for drops
+
+    # Capture undo (remove appended-in-hand piece if any)
+    hand_added_char: Optional[str]          # char appended (case-preserving)
+    hand_added_to: Optional[str]            # 'w' or 'b'
+    hand_added_index: Optional[int]         # index inserted/appended at time of capture undo
+
+    # Repetition undo (decrement this key)
+    rep_key_after: Optional[str]
+
+
+@dataclass(slots=True)
+class _UndoMinimal:
+    move: Move
+    moved_piece: Optional['Piece']
+    captured_piece: Optional['Piece']
 
 class BattledanceBoard:
     """
@@ -520,6 +635,8 @@ class BattledanceBoard:
         # Map position keys to number of occurrences so far
         self.repetition_counts: Dict[str, int] = {}
 
+        self._rebuild_fast_state()
+
         # Record the initial position for repetition tracking.
         self.record_state()
 
@@ -570,21 +687,68 @@ class BattledanceBoard:
     def record_state(self) -> None:
         """
         Update the internal repetition table for the current position.
-
-        Called after the initial setup and after every applied move.
+        Also caches the last position key so undo logic doesn't re-hash.
         """
         key = self._position_key()
         self.repetition_counts[key] = self.repetition_counts.get(key, 0) + 1
+        self._last_rep_key = key
+
+    def _rebuild_fast_state(self) -> None:
+        """(Re)build fast caches: occupied squares, bishop squares, hand counts."""
+        self._pos_w: set[Tuple[int, int]] = set()
+        self._pos_b: set[Tuple[int, int]] = set()
+        self._bishops_w: set[Tuple[int, int]] = set()
+        self._bishops_b: set[Tuple[int, int]] = set()
+
+        for r in range(8):
+            for c in range(8):
+                cell = self.board[r][c]
+                if cell is None:
+                    continue
+                if cell.color == "w":
+                    self._pos_w.add((r, c))
+                    if cell.kind == "B":
+                        self._bishops_w.add((r, c))
+                else:
+                    self._pos_b.add((r, c))
+                    if cell.kind == "B":
+                        self._bishops_b.add((r, c))
+
+        self._hand_w_counts: List[int] = [0] * 7
+        self._hand_b_counts: List[int] = [0] * 7
+
+        for ch in self.captured_w:
+            idx = HAND_INDEX.get(ch.upper())
+            if idx is not None:
+                self._hand_w_counts[idx] += 1
+
+        for ch in self.captured_b:
+            idx = HAND_INDEX.get(ch.upper())
+            if idx is not None:
+                self._hand_b_counts[idx] += 1
+
+        if not hasattr(self, "_last_rep_key"):
+            self._last_rep_key = None
 
     def repetition_count(self) -> int:
         """
         Return how many times the current position has occurred so far
         in this game (including the current occurrence).
+
+        Fast path: use cached _last_rep_key set by record_state().
+        Fallback: compute key if cache missing (should be rare).
         """
         if not hasattr(self, "repetition_counts"):
             return 1
-        key = self._position_key()
-        return self.repetition_counts.get(key, 0)
+
+        key = getattr(self, "_last_rep_key", None)
+        if key is None:
+            # Fallback: if someone calls repetition_count before record_state()
+            key = self._position_key()
+
+        cnt = self.repetition_counts.get(key, 0)
+        # If record_state() wasn't called for this position, treat as first occurrence.
+        return cnt if cnt > 0 else 1
 
     @classmethod
     def symmetrical_leaps(cls, kind: str) -> List[Tuple[int, int]]:
@@ -602,7 +766,7 @@ class BattledanceBoard:
                     if dx != dy:
                         offsets.add((sx * dy, sy * dx))
 
-        result = list(offsets)
+        result = sorted(offsets)
         cls._LEAP_CACHE[kind] = result
         return result
 
@@ -622,50 +786,53 @@ class BattledanceBoard:
                     if dx != dy:
                         dirs.add((sx * dy, sy * dx))
 
-        result = list(dirs)
+        result = sorted(dirs)
         cls._SLIDE_CACHE[kind] = result
         return result
 
     def get_bishop_positions(self, color: str) -> List[Tuple[int, int]]:
         """Return positions of all royal bishops of the given colour."""
-        positions: List[Tuple[int, int]] = []
-        for r in range(8):
-            for c in range(8):
-                cell = self.board[r][c]
-                if cell is not None and cell.kind == 'B' and cell.color == color:
-                    positions.append((r, c))
-        return positions
+        if not hasattr(self, "_bishops_w"):
+            self._rebuild_fast_state()
+        s = self._bishops_w if color == "w" else self._bishops_b
+        return list(s)
 
     def is_square_attacked(self, row: int, col: int, by_color: str) -> bool:
         """
         Determine if (row, col) is attacked by a piece of colour ``by_color``.
         Drops cannot capture, so only leaps and slides are considered.
         """
-        for r in range(8):
-            for c in range(8):
-                cell = self.board[r][c]
-                if cell is None or cell.color != by_color:
-                    continue
-                kind = cell.kind
-                # Check leap attacks
-                for dx, dy in self.symmetrical_leaps(kind):
-                    nr, nc = r + dx, c + dy
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
+        positions = self._pos_w if by_color == "w" else self._pos_b
+        board = self.board
+        sym_leaps = self.symmetrical_leaps
+        sym_slides = self.symmetrical_slides
+
+        for r, c in positions:
+            cell = board[r][c]
+            if cell is None or cell.color != by_color:
+                continue
+            kind = cell.kind
+
+            for dx, dy in sym_leaps(kind):
+                if r + dx == row and c + dy == col:
+                    return True
+
+            for dx, dy in sym_slides(kind):
+                step = 1
+                while True:
+                    nr = r + dx * step
+                    nc = c + dy * step
+                    if not (0 <= nr < 8 and 0 <= nc < 8):
+                        break
                     if nr == row and nc == col:
                         return True
-                # Check slide attacks
-                for dx, dy in self.symmetrical_slides(kind):
-                    step = 1
-                    while True:
-                        nr = r + dx * step
-                        nc = c + dy * step
-                        if not (0 <= nr < 8 and 0 <= nc < 8):
-                            break
-                        target = self.board[nr][nc]
-                        if nr == row and nc == col:
-                            return True
-                        if target is not None:
-                            break
-                        step += 1
+                    if board[nr][nc] is not None:
+                        break
+                    step += 1
+
         return False
 
     def is_in_check(self, color: str) -> bool:
@@ -680,58 +847,71 @@ class BattledanceBoard:
         """
         Generate all possible moves (including drops) for ``color``
         without considering whether the move leaves a royal bishop
-        attacked.  These moves will be filtered later.
+        attacked. These moves will be filtered later.
+
+        Optimized: iterate cached piece positions instead of scanning 64 squares.
         """
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
         moves: List[Move] = []
-        # Piece moves
-        for r in range(8):
-            for c in range(8):
-                cell = self.board[r][c]
-                if cell is None or cell.color != color:
+        board = self.board
+        positions = self._pos_w if color == "w" else self._pos_b
+
+        # Piece moves (iterate only occupied squares for this color)
+        for r, c in sorted(positions):
+            cell = board[r][c]
+            if cell is None or cell.color != color:
+                # Defensive against any cache drift
+                continue
+
+            kind = cell.kind
+            leaps = self.symmetrical_leaps(kind)
+            slides = self.symmetrical_slides(kind)
+
+            # Leap moves
+            for dx, dy in leaps:
+                nr, nc = r + dx, c + dy
+                if not (0 <= nr < 8 and 0 <= nc < 8):
                     continue
-                kind = cell.kind
-                leaps = self.symmetrical_leaps(kind)
-                slides = self.symmetrical_slides(kind)
+                target = board[nr][nc]
+                if target is None or target.color != color:
+                    moves.append(Move("move", (r, c), (nr, nc)))
 
-                # Leap moves
-                for dx, dy in leaps:
-                    nr, nc = r + dx, c + dy
+            # Slide moves
+            for dx, dy in slides:
+                step = 1
+                while True:
+                    nr = r + dx * step
+                    nc = c + dy * step
                     if not (0 <= nr < 8 and 0 <= nc < 8):
-                        continue
-                    target = self.board[nr][nc]
-                    if target is None or target.color != color:
-                        moves.append(Move('move', (r, c), (nr, nc)))
-
-                # Slide moves
-                for dx, dy in slides:
-                    step = 1
-                    while True:
-                        nr = r + dx * step
-                        nc = c + dy * step
-                        if not (0 <= nr < 8 and 0 <= nc < 8):
-                            break
-                        target = self.board[nr][nc]
-                        if target is None:
-                            moves.append(Move('move', (r, c), (nr, nc)))
-                            step += 1
-                            continue
-                        elif target.color != color:
-                            moves.append(Move('move', (r, c), (nr, nc)))
                         break
+                    target = board[nr][nc]
+                    if target is None:
+                        moves.append(Move("move", (r, c), (nr, nc)))
+                        step += 1
+                        continue
+                    elif target.color != color:
+                        moves.append(Move("move", (r, c), (nr, nc)))
+                    break
 
-        # Drop moves
-        captured_list = self.captured_w if color == 'w' else self.captured_b
+        # Drop moves (dedupe by piece type, preserving first-seen order)
+        captured_list = self.captured_w if color == "w" else self.captured_b
+        seen = set()
         for ch in captured_list:
+            if ch in seen:
+                continue
+            seen.add(ch)
             for hr in self.home_rows(color):
                 for col in range(8):
-                    if self.board[hr][col] is None:
-                        moves.append(Move('drop', None, (hr, col), drop_type=ch))
+                    if board[hr][col] is None:
+                        moves.append(Move("drop", None, (hr, col), drop_type=ch))
+
         return moves
 
     def generate_legal_moves(self, color: str) -> List[Move]:
         cand = self.generate_moves_unfiltered(color)
 
-        # First: collect all bishop-capture moves.
         bishop_caps: List[Move] = []
         for move in cand:
             if move.kind == 'move':
@@ -740,18 +920,18 @@ class BattledanceBoard:
                 if target is not None and target.kind == 'B' and target.color != color:
                     bishop_caps.append(move)
 
-        # If any bishop captures exist, they are the only legal moves.
         if bishop_caps:
             return bishop_caps
 
-        # Otherwise fall back to normal “don’t leave my bishops in check” logic.
         legal: List[Move] = []
         for move in cand:
-            clone = self.copy()
-            clone.apply_move(move)
-            if clone.is_in_check(color):
-                continue
-            legal.append(move)
+            undo = self._apply_move_minimal(move)
+            try:
+                if not self.is_in_check(color):
+                    legal.append(move)
+            finally:
+                self._unapply_move_minimal(undo)
+
         return legal
 
     def copy(self) -> 'BattledanceBoard':
@@ -767,61 +947,115 @@ class BattledanceBoard:
         clone.plys_since_capture_or_drop = self.plys_since_capture_or_drop
         clone.plys_since_game_start = self.plys_since_game_start
         clone.repetition_counts = dict(self.repetition_counts)
+
+        # fast caches
+        clone._pos_w = set(self._pos_w)
+        clone._pos_b = set(self._pos_b)
+        clone._bishops_w = set(self._bishops_w)
+        clone._bishops_b = set(self._bishops_b)
+        clone._hand_w_counts = list(self._hand_w_counts)
+        clone._hand_b_counts = list(self._hand_b_counts)
+        clone._last_rep_key = getattr(self, "_last_rep_key", None)
+
         return clone
 
     def apply_move(self, move: Move) -> Optional[str]:
         """
         Apply a move and update counters and repetition history.  Returns
-        'w' if White wins, 'b' if Black wins, or None if the game
-        continues.  Capturing a royal bishop ends the game.  Counters
-        are reset after any capture or drop.
+        'w' if White wins, 'b' if Black wins, or None if the game continues.
+        Capturing a royal bishop ends the game.  Counters are reset after
+        any capture or drop.
         """
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
         color = self.turn
         enemy = 'b' if color == 'w' else 'w'
         winner: Optional[str] = None
         capture_or_drop = False
+
+        pos_self = self._pos_w if color == "w" else self._pos_b
+        pos_enemy = self._pos_b if color == "w" else self._pos_w
+        bishops_self = self._bishops_w if color == "w" else self._bishops_b
+        bishops_enemy = self._bishops_b if color == "w" else self._bishops_w
+
         if move.kind == 'move':
             fr, fc = move.from_pos
             tr, tc = move.to_pos
             piece = self.board[fr][fc]
             target = self.board[tr][tc]
-            # Move piece
-            self.board[fr][fc] = None
+
+            pos_self.discard((fr, fc))
+            pos_self.add((tr, tc))
+            if piece.kind == "B":
+                bishops_self.discard((fr, fc))
+                bishops_self.add((tr, tc))
+
             if target is not None:
-                # capturing bishop ends game
-                if target.kind == 'B':
+                pos_enemy.discard((tr, tc))
+                if target.kind == "B":
+                    bishops_enemy.discard((tr, tc))
                     winner = color
-                captured_char = target.kind.upper() if color == 'w' else target.kind.lower()
+
                 if winner is None:
-                    # captured piece becomes in hand
+                    captured_char = target.kind.upper() if color == 'w' else target.kind.lower()
                     if color == 'w':
                         self.captured_w.append(captured_char)
+                        idx = HAND_INDEX.get(captured_char.upper())
+                        if idx is not None:
+                            self._hand_w_counts[idx] += 1
                     else:
                         self.captured_b.append(captured_char)
+                        idx = HAND_INDEX.get(captured_char.upper())
+                        if idx is not None:
+                            self._hand_b_counts[idx] += 1
                 capture_or_drop = True
-            # Place piece
-            self.board[tr][tc] = Piece(piece.kind, color)
+
+            self.board[fr][fc] = None
+            self.board[tr][tc] = piece
+
         else:
-            # Drop move
             tr, tc = move.to_pos
             ch = move.drop_type
             drop_color = 'w' if ch.isupper() else 'b'
             drop_kind = ch.upper()
+            if drop_color != color:
+                raise ValueError(
+                    f"Illegal drop: side to move is {color} but drop_type implies {drop_color} ({ch!r})."
+                )
+
             self.board[tr][tc] = Piece(drop_kind, drop_color)
+
+            if drop_color == "w":
+                self._pos_w.add((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_w.add((tr, tc))
+            else:
+                self._pos_b.add((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_b.add((tr, tc))
+
             if drop_color == 'w':
                 self.captured_w.remove(ch)
+                idx = HAND_INDEX.get(drop_kind)
+                if idx is not None:
+                    self._hand_w_counts[idx] -= 1
             else:
                 self.captured_b.remove(ch)
+                idx = HAND_INDEX.get(drop_kind)
+                if idx is not None:
+                    self._hand_b_counts[idx] -= 1
+
             capture_or_drop = True
-        # Switch turn
+
         self.turn = enemy
-        # Update counters
+
         self.plys_since_game_start += 1
         if capture_or_drop:
             self.plys_since_capture_or_drop = 0
         else:
             self.plys_since_capture_or_drop += 1
-        # Record new state
+
         self.record_state()
         return winner
 
@@ -838,73 +1072,312 @@ class BattledanceBoard:
             return True
         return False
 
+    def apply_move_with_undo(self, move: Move) -> Tuple[Optional[str], _UndoFull]:
+        """
+        Apply a move *in-place* and return (winner, undo_record) so the move
+        can be undone exactly (including hand order, counters, repetition).
+        """
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
+        prev_turn = self.turn
+        prev_pcd = self.plys_since_capture_or_drop
+        prev_pgs = self.plys_since_game_start
+        prev_last_rep_key = getattr(self, "_last_rep_key", None)
+
+        moved_piece: Optional[Piece] = None
+        captured_piece: Optional[Piece] = None
+        drop_removed_index: Optional[int] = None
+        hand_added_char: Optional[str] = None
+        hand_added_to: Optional[str] = None
+        hand_added_index: Optional[int] = None
+
+        if move.kind == "move":
+            fr, fc = move.from_pos
+            tr, tc = move.to_pos
+            moved_piece = self.board[fr][fc]
+            captured_piece = self.board[tr][tc]
+            if captured_piece is not None and captured_piece.kind != "B":
+                hand_added_char = captured_piece.kind.upper() if prev_turn == "w" else captured_piece.kind.lower()
+                hand_added_to = prev_turn
+                # apply_move() appends to the end; record the exact index it will occupy.
+                hand_added_index = len(self.captured_w) if prev_turn == "w" else len(self.captured_b)
+        else:
+            ch = move.drop_type
+            lst = self.captured_w if ch.isupper() else self.captured_b
+            drop_removed_index = lst.index(ch)
+
+        winner = self.apply_move(move)
+        rep_key_after = getattr(self, "_last_rep_key", None)
+
+        undo = _UndoFull(
+            prev_turn=prev_turn,
+            prev_plys_since_capture_or_drop=prev_pcd,
+            prev_plys_since_game_start=prev_pgs,
+            prev_last_rep_key=prev_last_rep_key,
+
+            move=move,
+            moved_piece=moved_piece,
+            captured_piece=captured_piece,
+
+            drop_removed_index=drop_removed_index,
+
+            hand_added_char=hand_added_char,
+            hand_added_to=hand_added_to,
+            hand_added_index=hand_added_index,
+
+            rep_key_after=rep_key_after,
+        )
+        return winner, undo
+
+    def unapply_move(self, undo: _UndoFull) -> None:
+        """Undo a move previously applied by apply_move_with_undo()."""
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
+        key = undo.rep_key_after
+        if key is not None:
+            cnt = self.repetition_counts.get(key, 0)
+            if cnt <= 1:
+                self.repetition_counts.pop(key, None)
+            else:
+                self.repetition_counts[key] = cnt - 1
+
+        self.turn = undo.prev_turn
+        self.plys_since_capture_or_drop = undo.prev_plys_since_capture_or_drop
+        self.plys_since_game_start = undo.prev_plys_since_game_start
+        self._last_rep_key = undo.prev_last_rep_key
+
+        move = undo.move
+        board = self.board
+
+        if move.kind == "move":
+            fr, fc = move.from_pos
+            tr, tc = move.to_pos
+
+            mover = undo.prev_turn
+            pos_self = self._pos_w if mover == "w" else self._pos_b
+            pos_enemy = self._pos_b if mover == "w" else self._pos_w
+            bishops_self = self._bishops_w if mover == "w" else self._bishops_b
+            bishops_enemy = self._bishops_b if mover == "w" else self._bishops_w
+
+            board[fr][fc] = undo.moved_piece
+            board[tr][tc] = undo.captured_piece
+
+            pos_self.discard((tr, tc))
+            pos_self.add((fr, fc))
+            if undo.moved_piece is not None and undo.moved_piece.kind == "B":
+                bishops_self.discard((tr, tc))
+                bishops_self.add((fr, fc))
+
+            if undo.captured_piece is not None:
+                pos_enemy.add((tr, tc))
+                if undo.captured_piece.kind == "B":
+                    bishops_enemy.add((tr, tc))
+
+            if undo.hand_added_char is not None and undo.hand_added_to is not None:
+                if undo.hand_added_to == "w":
+                    idx0 = undo.hand_added_index
+                    if isinstance(idx0, int) and 0 <= idx0 < len(self.captured_w) and self.captured_w[idx0] == undo.hand_added_char:
+                        del self.captured_w[idx0]
+                    else:
+                        # Fallback to previous behavior
+                        self.captured_w.pop()
+                    hi = HAND_INDEX.get(undo.hand_added_char.upper())
+                    if hi is not None:
+                        self._hand_w_counts[hi] -= 1
+                else:
+                    idx0 = undo.hand_added_index
+                    if isinstance(idx0, int) and 0 <= idx0 < len(self.captured_b) and self.captured_b[idx0] == undo.hand_added_char:
+                        del self.captured_b[idx0]
+                    else:
+                        self.captured_b.pop()
+                    hi = HAND_INDEX.get(undo.hand_added_char.upper())
+                    if hi is not None:
+                        self._hand_b_counts[hi] -= 1
+
+        else:
+            tr, tc = move.to_pos
+            ch = move.drop_type
+            drop_color = "w" if ch.isupper() else "b"
+            drop_kind = ch.upper()
+
+            board[tr][tc] = None
+
+            if drop_color == "w":
+                self._pos_w.discard((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_w.discard((tr, tc))
+            else:
+                self._pos_b.discard((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_b.discard((tr, tc))
+
+            idx = int(undo.drop_removed_index or 0)
+            if drop_color == "w":
+                self.captured_w.insert(idx, ch)
+                hi = HAND_INDEX.get(drop_kind)
+                if hi is not None:
+                    self._hand_w_counts[hi] += 1
+            else:
+                self.captured_b.insert(idx, ch)
+                hi = HAND_INDEX.get(drop_kind)
+                if hi is not None:
+                    self._hand_b_counts[hi] += 1
+
+    def _apply_move_minimal(self, move: Move) -> _UndoMinimal:
+        """
+        Apply a move in-place for legality checking only.
+        Does NOT touch: hands, counters, repetition, turn.
+        Does touch: board + fast caches (pos/bishops).
+        """
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
+        board = self.board
+
+        if move.kind == "move":
+            fr, fc = move.from_pos
+            tr, tc = move.to_pos
+            moved = board[fr][fc]
+            captured = board[tr][tc]
+
+            mover = moved.color
+            pos_self = self._pos_w if mover == "w" else self._pos_b
+            pos_enemy = self._pos_b if mover == "w" else self._pos_w
+            bishops_self = self._bishops_w if mover == "w" else self._bishops_b
+            bishops_enemy = self._bishops_b if mover == "w" else self._bishops_w
+
+            # Robust cache ops (no KeyError if drift ever occurs)
+            pos_self.discard((fr, fc))
+            pos_self.add((tr, tc))
+            if moved.kind == "B":
+                bishops_self.discard((fr, fc))
+                bishops_self.add((tr, tc))
+
+            if captured is not None:
+                pos_enemy.discard((tr, tc))
+                if captured.kind == "B":
+                    bishops_enemy.discard((tr, tc))
+
+            board[fr][fc] = None
+            board[tr][tc] = moved
+
+            return _UndoMinimal(move=move, moved_piece=moved, captured_piece=captured)
+
+        else:
+            tr, tc = move.to_pos
+            ch = move.drop_type
+            drop_color = "w" if ch.isupper() else "b"
+            drop_kind = ch.upper()
+            dropped = Piece(drop_kind, drop_color)
+
+            board[tr][tc] = dropped
+            if drop_color == "w":
+                self._pos_w.add((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_w.add((tr, tc))
+            else:
+                self._pos_b.add((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_b.add((tr, tc))
+
+            return _UndoMinimal(move=move, moved_piece=None, captured_piece=None)
+
+
+    def _unapply_move_minimal(self, undo: _UndoMinimal) -> None:
+        if not hasattr(self, "_pos_w"):
+            self._rebuild_fast_state()
+
+        board = self.board
+        move = undo.move
+
+        if move.kind == "move":
+            fr, fc = move.from_pos
+            tr, tc = move.to_pos
+            moved = undo.moved_piece
+            captured = undo.captured_piece
+
+            mover = moved.color
+            pos_self = self._pos_w if mover == "w" else self._pos_b
+            pos_enemy = self._pos_b if mover == "w" else self._pos_w
+            bishops_self = self._bishops_w if mover == "w" else self._bishops_b
+            bishops_enemy = self._bishops_b if mover == "w" else self._bishops_w
+
+            board[fr][fc] = moved
+            board[tr][tc] = captured
+
+            pos_self.discard((tr, tc))
+            pos_self.add((fr, fc))
+            if moved.kind == "B":
+                bishops_self.discard((tr, tc))
+                bishops_self.add((fr, fc))
+
+            if captured is not None:
+                pos_enemy.add((tr, tc))
+                if captured.kind == "B":
+                    bishops_enemy.add((tr, tc))
+
+        else:
+            tr, tc = move.to_pos
+            ch = move.drop_type
+            drop_color = "w" if ch.isupper() else "b"
+            drop_kind = ch.upper()
+
+            board[tr][tc] = None
+            if drop_color == "w":
+                self._pos_w.discard((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_w.discard((tr, tc))
+            else:
+                self._pos_b.discard((tr, tc))
+                if drop_kind == "B":
+                    self._bishops_b.discard((tr, tc))
+
     def encode_features(self) -> np.ndarray:
         """
         Encode the current state into a 594-dimensional float32 vector.
-
-        Features:
-        - 8 piece-specific planes for K,N,F,L,P,G,R,B (white +1, black −1)
-        - 1 plane for any piece (white +1, black −1)
-        - 14 in-hand scalars (White K,N,F,L,P,G,R, then Black K,N,F,L,P,G,R)
-          clipped at 4 and divided by 4
-        - side to move: +1 if White, −1 if Black
-        - 64-move counter: plys_since_capture_or_drop / 128
-        - repetition count: min(rep_count,3) / 3
-        - long game counter: plys_since_game_start / 4096
+        Same semantics as before, but faster:
+          * no (9,8,8) allocation
+          * in-hand counts maintained incrementally
         """
-        # Board planes: shape (9, 8, 8)
-        planes = np.zeros((9, 8, 8), dtype=np.float32)
+        if not hasattr(self, "_hand_w_counts"):
+            self._rebuild_fast_state()
 
-        # Pieces on board
+        out = np.zeros(FEATURE_TOTAL, dtype=np.float32)
+
         for r in range(8):
-            row = self.board[r]
             for c in range(8):
-                cell = row[c]
+                cell = self.board[r][c]
                 if cell is None:
                     continue
                 idx = PIECE_INDEX.get(cell.kind)
                 if idx is None:
                     continue
                 val = 1.0 if cell.color == 'w' else -1.0
-                planes[idx, r, c] = val
-                planes[8, r, c] = val  # "any piece" plane
+                sq = r * 8 + c
+                out[idx * 64 + sq] = val
+                out[8 * 64 + sq] = val
 
-        # Flatten planes once
-        feat = planes.reshape(FEATURE_PLANES)
+        base = FEATURE_PLANES
 
-        # In-hand features
-        in_hand = np.zeros(14, dtype=np.float32)
+        hw = self._hand_w_counts
+        hb = self._hand_b_counts
+        for i in range(7):
+            out[base + i] = min(hw[i], 4) / 4.0
+            out[base + 7 + i] = min(hb[i], 4) / 4.0
 
-        # white captured pieces (uppercase in list)
-        for i, t in enumerate(IN_HAND_TYPES):
-            count = 0
-            for ch in self.captured_w:
-                if ch.upper() == t:
-                    count += 1
-            in_hand[i] = min(count, 4) / 4.0
-
-        # black captured pieces (lowercase in list)
-        for i, t in enumerate(IN_HAND_TYPES):
-            count = 0
-            for ch in self.captured_b:
-                if ch.lower() == t.lower():
-                    count += 1
-            in_hand[7 + i] = min(count, 4) / 4.0
-
-        # Scalar features
         stm = 1.0 if self.turn == 'w' else -1.0
         m64 = min(self.plys_since_capture_or_drop / 128.0, 1.0)
         rep = min(self.repetition_count(), 3) / 3.0
         glen = min(self.plys_since_game_start / 4096.0, 1.0)
-        scalars = np.array([stm, m64, rep, glen], dtype=np.float32)
 
-        # Single allocation for full feature vector
-        out = np.empty(FEATURE_TOTAL, dtype=np.float32)
-        out[:FEATURE_PLANES] = feat
-        out[FEATURE_PLANES:FEATURE_PLANES + 14] = in_hand
-        out[FEATURE_PLANES + 14:] = scalars
+        out[base + 14 + 0] = stm
+        out[base + 14 + 1] = m64
+        out[base + 14 + 2] = rep
+        out[base + 14 + 3] = glen
+
         return out
-
 
 ###############################################################################
 #  Neural network
@@ -985,12 +1458,15 @@ class MLP:
 
     def crossover(self, other: 'MLP', rnd: np.random.RandomState) -> 'MLP':
         """Return a child network from this and another network via uniform crossover."""
-        child = MLP()
+        # Avoid calling __init__ (which does Xavier init we immediately overwrite).
+        child = MLP.__new__(MLP)
+
         for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3', 'W4', 'b4']:
             a: np.ndarray = getattr(self, attr)
             b: np.ndarray = getattr(other, attr)
             mask = rnd.rand(*a.shape) < 0.5
             setattr(child, attr, np.where(mask, a, b).astype(np.float32))
+
         return child
 
     def to_dict(self) -> Dict[str, np.ndarray]:
@@ -998,9 +1474,17 @@ class MLP:
 
     @classmethod
     def from_dict(cls, data: Dict[str, np.ndarray]) -> 'MLP':
-        net = cls()
-        for attr in data:
-            setattr(net, attr, data[attr].astype(np.float32))
+        """
+        Construct an MLP directly from parameter arrays without calling __init__.
+        Avoids wasted Xavier initialisation when loading from disk.
+        """
+        net = cls.__new__(cls)
+        for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3', 'W4', 'b4']:
+            arr = np.asarray(data[attr], dtype=np.float32)
+            # Ensure we own writable storage (pickle can give odd flags sometimes)
+            if not arr.flags.writeable:
+                arr = arr.copy()
+            setattr(net, attr, arr)
         return net
 
 
@@ -1036,32 +1520,33 @@ class Agent:
         if not legal:
             return None
 
-        candidate_moves = legal
         scores: List[float] = []
-        for mv in candidate_moves:
-            clone = board.copy()
-            result = clone.apply_move(mv)
-            if result is not None:
-                # Capturing bishop → immediate win/loss
-                score = 1e6 if result == color else -1e6
-            else:
-                v = self.evaluate_state(clone)
-                score = v if color == 'w' else -v
-            scores.append(score)
+        for mv in legal:
+            winner, undo = board.apply_move_with_undo(mv)
+            try:
+                if winner is not None:
+                    score = 1e6 if winner == color else -1e6
+                else:
+                    v = self.evaluate_state(board)
+                    score = v if color == 'w' else -v
+                scores.append(score)
+            finally:
+                board.unapply_move(undo)
 
         best = max(scores)
         worst = min(scores)
         if abs(best - worst) < 1e-9:
-            return random.choice(candidate_moves)
+            return random.choice(legal)
 
         norms = [(s - worst) / (best - worst) for s in scores]
         filtered: List[Tuple[Move, float]] = []
-        for mv, n in zip(candidate_moves, norms):
+        for mv, n in zip(legal, norms):
             if n > 0.8:
                 weight = (n - 0.8) / 0.2
                 filtered.append((mv, weight))
+
         if not filtered:
-            return random.choice(candidate_moves)
+            return random.choice(legal)
 
         total = sum(w for _, w in filtered)
         r = random.random() * total
@@ -1071,7 +1556,6 @@ class Agent:
             if r <= cum:
                 return mv
         return filtered[-1][0]
-
 
 ###############################################################################
 #  Environment wrapper
@@ -1110,103 +1594,80 @@ class BattledanceEnvironment:
 ###############################################################################
 
 def save_parents(parents: List[Agent], filepath: str) -> None:
-    """
-    Save a list of parent agents to disk.
-
-    In normal operation this will be a list of 8 parents, but the
-    function does not enforce the length.
-    """
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     serial = []
     for agent in parents:
         serial.append({
-            'name': agent.name,
-            'trainable': False,
-            'net': agent.net.to_dict(),
+            "name": agent.name,
+            "trainable": False,
+            "net": agent.net.to_dict(),
         })
-    with open(filepath, 'wb') as f:
-        pickle.dump(serial, f)
-
+    try:
+        _safe_write_pickle(filepath, serial, durable=True)
+    except Exception:
+        pass
 
 def load_parents(filepath: str) -> List[Agent]:
-    try:
-        with open(filepath, 'rb') as f:
-            serial = pickle.load(f)
-    except Exception:
+    data = _safe_read_pickle(filepath)
+    if not isinstance(data, list):
         return []
 
-    if not isinstance(serial, list):
-        return []  # not a parents file
-
     parents: List[Agent] = []
-    for data in serial:
-        if not isinstance(data, dict) or 'net' not in data:
+    for entry in data:
+        if not isinstance(entry, dict) or "net" not in entry:
             continue
-        agent = Agent(data.get('name', 'unknown'))
-        agent.trainable = False
-        agent.net = MLP.from_dict(data['net'])
-        parents.append(agent)
+        net_dict = entry.get("net")
+        if not isinstance(net_dict, dict):
+            continue
+        try:
+            net = MLP.from_dict(net_dict)
+        except Exception:
+            continue
+        parents.append(
+            Agent(
+                name=entry.get("name", "unknown"),
+                net=net,
+                trainable=False,
+            )
+        )
     return parents
 
-
 def save_champion(agent: Agent, filepath: str) -> None:
-    """Save a single champion agent to disk."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     data = {
-        'name': agent.name,
-        'trainable': False,
-        'net': agent.net.to_dict(),
+        "name": agent.name,
+        "trainable": False,
+        "net": agent.net.to_dict(),
     }
-    with open(filepath, 'wb') as f:
-        pickle.dump(data, f)
-
+    try:
+        _safe_write_pickle(filepath, data, durable=True)
+    except Exception:
+        pass
 
 def load_champion(filepath: str) -> Optional[Agent]:
-    """
-    Load a champion agent from a snapshot file.
-
-    This is tolerant of both storage formats:
-      * Single-champion snapshot: a dict with keys {'name', 'net', ...}.
-      * Parent snapshot: a list of 8 dicts, where element 0 is the champion.
-
-    Returns None if the file cannot be read or does not match either format.
-    """
-    try:
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-    except Exception:
+    data = _safe_read_pickle(filepath)
+    if data is None:
         return None
 
     # Case 1: single champion dict
-    if isinstance(data, dict) and 'net' in data:
-        name = data.get('name', 'unknown')
-        agent = Agent(name)
-        agent.trainable = False
-        agent.net = MLP.from_dict(data['net'])
-        return agent
+    if isinstance(data, dict) and "net" in data and isinstance(data["net"], dict):
+        try:
+            net = MLP.from_dict(data["net"])
+        except Exception:
+            return None
+        return Agent(name=data.get("name", "unknown"), net=net, trainable=False)
 
-    # Case 2: list of parent dicts (8 parents); first entry is champion
+    # Case 2: list of parent dicts
     if isinstance(data, list) and data:
         champ_data = data[0]
-        if isinstance(champ_data, dict) and 'net' in champ_data:
-            name = champ_data.get('name', 'unknown')
-            agent = Agent(name)
-            agent.trainable = False
-            agent.net = MLP.from_dict(champ_data['net'])
-            return agent
+        if isinstance(champ_data, dict) and "net" in champ_data and isinstance(champ_data["net"], dict):
+            try:
+                net = MLP.from_dict(champ_data["net"])
+            except Exception:
+                return None
+            return Agent(name=champ_data.get("name", "unknown"), net=net, trainable=False)
 
-    # Unknown format
     return None
 
 def save_population_state(name: str, population: List[Agent], gen: int, base_dir: str) -> None:
-    """
-    Persist the full GA population for `name` into the `_0` slot.
-
-    While an agent is in state "pending" for the current cycle, its
-    `{name}_0.pkl` file contains this population snapshot (kind="population").
-    Once training succeeds for that agent, `_0` is overwritten with an
-    8-parent list via `save_parents`.
-    """
     path = os.path.join(base_dir, f"{name}_0.pkl")
     serial = {
         "kind": "population",
@@ -1221,45 +1682,44 @@ def save_population_state(name: str, population: List[Agent], gen: int, base_dir
         ],
     }
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(serial, f)
+        _safe_write_pickle(path, serial, durable=True)
     except Exception:
-        # Population snapshots are for resumability only; never crash training.
         pass
 
-
 def load_population_state(name: str, base_dir: str) -> Optional[Tuple[List[Agent], int]]:
-    """
-    Load a saved GA population for `name` from the `_0` slot, if present.
-
-    Returns (population, generation) if `_0` currently stores a
-    population snapshot (kind="population"), otherwise returns None.
-    """
     path = os.path.join(base_dir, f"{name}_0.pkl")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-    except Exception:
+    data = _safe_read_pickle(path)
+    if not (isinstance(data, dict) and data.get("kind") == "population"):
         return None
 
-    if not (isinstance(data, dict) and data.get("kind") == "population" and "agents" in data):
+    gen = int(data.get("generation", 0) or 0)
+    agents_data = data.get("agents")
+    if not isinstance(agents_data, list):
         return None
 
-    gen = int(data.get("generation", 0))
-    agents_data = data["agents"]
     population: List[Agent] = []
     for ad in agents_data:
-        agent = Agent(ad.get("name", "unknown"))
-        agent.trainable = bool(ad.get("trainable", True))
-        net_dict = ad.get("net")
-        if isinstance(net_dict, dict):
-            agent.net = MLP.from_dict(net_dict)
-        population.append(agent)
-    return population, gen
+        if not isinstance(ad, dict):
+            continue
 
+        net_dict = ad.get("net")
+        try:
+            net = MLP.from_dict(net_dict) if isinstance(net_dict, dict) else MLP()
+        except Exception:
+            net = MLP()
+
+        population.append(
+            Agent(
+                name=str(ad.get("name", "unknown")),
+                net=net,
+                trainable=bool(ad.get("trainable", True)),
+            )
+        )
+
+    if not population:
+        return None
+
+    return population, gen
 
 def normalise(values: Sequence[float]) -> List[float]:
     """Normalise a sequence of values to [0,1]; if all equal, return 1 for all."""
@@ -1278,6 +1738,7 @@ def evaluate_population_stage1(
     opponents: List[Agent],
     env: BattledanceEnvironment,
     n_per_colour: int,
+    stop_event=None,
 ) -> Tuple[List[int], List[int], List[List[Tuple[int, int]]]]:
     """
     Stage-1 population evaluation with per-game resumability.
@@ -1337,6 +1798,7 @@ def evaluate_population_stage1(
             },
         }
         save_ga_progress(progress)
+        check_stop(stop_event, ga_progress=progress)
     else:
         # Ensure Stage-1 arrays exist even if Stage-2 has already started
         s1 = progress.get("stage1") or {}
@@ -1351,7 +1813,7 @@ def evaluate_population_stage1(
             progress["stage1"] = s1
             progress.setdefault("stage", "stage1")
             save_ga_progress(progress)
-
+            check_stop(stop_event, ga_progress=progress)
     stage = progress.get("stage", "stage1")
     s1 = progress["stage1"]
     game_index = int(s1.get("game_index", 0) or 0)
@@ -1430,9 +1892,9 @@ def evaluate_population_stage1(
         progress["stage1"] = s1
         progress["stage"] = "stage1"
         save_ga_progress(progress)
-
+        check_stop(stop_event, ga_progress=progress)
     # Clean newline after the status bar
-    print()
+    status_newline()
 
     # ------------------------------------------------------------------
     # Stage-1 finished: compute sum/min and snapshot stats, mark complete
@@ -1456,7 +1918,7 @@ def evaluate_population_stage1(
     progress["stage1"] = s1
     progress["stage"] = "stage1_complete"
     save_ga_progress(progress)
-
+    check_stop(stop_event, ga_progress=progress)
     return sum_margins, min_margins, snapshot_stats
 
 
@@ -1469,6 +1931,7 @@ def refine_top_candidates(
     n1_per_colour: int,
     n2_per_colour: int,
     use_worst_only: bool = False,
+    stop_event=None,
 ) -> Tuple[List[int], dict[int, int], dict[int, int], dict[int, List[Tuple[int, int]]]]:
     """
     Stage-2 heavy evaluation on a small subset of candidates with per-game
@@ -1576,7 +2039,7 @@ def refine_top_candidates(
             },
         }
         save_ga_progress(progress)
-
+        check_stop(stop_event, ga_progress=progress)
     stage = progress.get("stage", "stage1_complete")
 
     # Ensure Stage-1 snapshot stats are present (for candidates outside top_indices)
@@ -1588,7 +2051,7 @@ def refine_top_candidates(
         progress["stage1"]["draws"] = s1_draws
         progress["stage1"]["snapshot_stats"] = snapshot_stats_stage1
         save_ga_progress(progress)
-
+        check_stop(stop_event, ga_progress=progress)
     s1_snapshot_stats: List[List[Tuple[int, int]]] = progress["stage1"]["snapshot_stats"]
 
     # Initialise Stage-2 section if not present or if we are just leaving Stage-1.
@@ -1609,7 +2072,7 @@ def refine_top_candidates(
         }
         progress["stage"] = "stage2"
         save_ga_progress(progress)
-
+        check_stop(stop_event, ga_progress=progress)
     s2 = progress["stage2"]
     # Ensure top_indices match
     if s2.get("top_indices") != list(top_indices):
@@ -1631,7 +2094,7 @@ def refine_top_candidates(
         progress["stage2"] = s2
         progress["stage"] = "stage2"
         save_ga_progress(progress)
-
+        check_stop(stop_event, ga_progress=progress)
     snapshot_margins_stage2: Dict[str, List[int]] = s2["snapshot_margins"]
     snapshot_draws_stage2: Dict[str, List[int]] = s2["snapshot_draws"]
     game_index = int(s2.get("game_index", 0) or 0)
@@ -1727,9 +2190,9 @@ def refine_top_candidates(
         progress["stage2"] = s2
         progress["stage"] = "stage2"
         save_ga_progress(progress)
-
+        check_stop(stop_event, ga_progress=progress)
     # Clean newline after status line
-    print()
+    status_newline()
 
     # ------------------------------------------------------------------
     # Stage-2 finished: compute final metrics for top_indices
@@ -1753,7 +2216,7 @@ def refine_top_candidates(
     progress["stage2"] = s2
     progress["stage"] = "done"
     save_ga_progress(progress)
-
+    check_stop(stop_event, ga_progress=progress)
     # ------------------------------------------------------------------
     # Build ordering within the finalists by Stage-2 fitness
     # ------------------------------------------------------------------
@@ -1776,37 +2239,69 @@ def refine_top_candidates(
 
     return ordered_indices, final_sum_margins, final_min_margins, snapshot_stats_stage2
 
+def _coerce_to_8_parents(
+    parents: List[Agent],
+    rnd: np.random.RandomState,
+    *,
+    fallback_name: str,
+) -> List[Agent]:
+    """
+    Ensure we have exactly 8 parent Agents.
+
+    - If >= 8: truncate.
+    - If 1..7: pad by cloning existing parents (chosen via rnd).
+    - If 0: synthesize 8 fresh Xavier-initialised parents (rare; indicates corrupt/missing parents file).
+    """
+    if len(parents) >= 8:
+        return parents[:8]
+
+    if len(parents) == 0:
+        # Last-resort: make 8 fresh parents so the run doesn't crash.
+        # This is intentionally non-deterministic across runs unless rnd is seeded.
+        fresh: List[Agent] = []
+        for _ in range(8):
+            net_seed = int(rnd.randint(0, 2**31 - 1))
+            fresh.append(
+                Agent(
+                    name=fallback_name,
+                    net=MLP(input_dim=594, hidden_dim=512, seed=net_seed),
+                    trainable=False,
+                )
+            )
+        log(f"[{fallback_name}] WARNING: parent list empty; synthesised 8 fresh parents.")
+        return fresh
+
+    out: List[Agent] = list(parents)
+    while len(out) < 8:
+        k = int(rnd.randint(0, len(out)))
+        out.append(out[k].clone())
+        out[-1].trainable = False
+    return out
 
 def build_children(parents: List[Agent], rnd: np.random.RandomState) -> List[Agent]:
     """
-    Generate 256 non-elite children from 8 parents using a uniform
-    crossover grid:
+    Generate 256 non-elite children from (up to) 8 parents using a uniform
+    crossover grid.
 
-      * For each ordered pair (i, j) with i,j in {0..7}, generate 4 children.
-      * Each child is produced by crossover(p_i, p_j) plus mutation.
-
-    Total: 8 * 8 * 4 = 256 children. Elites are handled separately.
+    Robustness: if parents != 8 due to corrupted/legacy files, we pad/truncate
+    so training continues instead of crashing.
     """
-    if len(parents) != 8:
-        raise ValueError(f"build_children expects exactly 8 parents, got {len(parents)}")
+    fallback_name = parents[0].name if parents else (CURRENT_AGENT_NAME or "unknown")
+    parents8 = _coerce_to_8_parents(parents, rnd, fallback_name=fallback_name)
 
     children: List[Agent] = []
     for i in range(8):
         for j in range(8):
-            p1 = parents[i]
-            p2 = parents[j]
+            p1 = parents8[i]
+            p2 = parents8[j]
             for _ in range(4):
                 child_net = p1.net.crossover(p2.net, rnd)
-                child_net.mutate(mutation_rate=0.03125, weight_decay=0.0005, rnd=rnd)
-                child = Agent(p1.name)
-                child.net = child_net
-                child.trainable = True
-                children.append(child)
+                child_net.mutate(mutation_rate=0.015625, weight_decay=0.00001526, rnd=rnd)
+                children.append(Agent(name=p1.name, net=child_net, trainable=True))
 
     # Sanity: 256 children
     assert len(children) == 256, f"Expected 256 children, got {len(children)}"
     return children
-
 
 def build_population_from_parents(
     name: str,
@@ -1814,41 +2309,31 @@ def build_population_from_parents(
     rnd: np.random.RandomState,
 ) -> List[Agent]:
     """
-    Given an 8-net parent set, build a 260-net GA population:
+    Given a parent set, build a 260-net GA population:
 
-      * 256 non-elite children produced via crossover/mutation of all 8 parents.
-      * 4 elite direct clones of parents[0..3].
+      * 256 children produced via crossover/mutation of an 8-parent pool.
+      * 4 elite direct clones of the top four parents.
 
-    The 4 elites are preserved as-is (never mutated) and are appended to
-    the population for evaluation. The remaining 4 parents are used only
-    as genetic sources when generating children; they are not injected
-    into the evaluation population.
+    Robustness: parents are coerced to exactly 8 so legacy/corrupt files
+    do not crash the run.
     """
-    if not parents:
-        raise ValueError("build_population_from_parents: empty parent list")
-
-    # Use at most the first 8 parents; this should always be exactly 8.
-    if len(parents) > 8:
-        parents = parents[:8]
+    parents8 = _coerce_to_8_parents(parents, rnd, fallback_name=(name or CURRENT_AGENT_NAME or "unknown"))
 
     # 256 mutated children from the full 8-parent grid
-    children = build_children(parents, rnd)
+    children = build_children(parents8, rnd)
 
     pop: List[Agent] = []
     pop.extend(children)
 
     # 4 elites as direct clones of the top four parents
     elites: List[Agent] = []
-    for i in range(min(4, len(parents))):
-        elite = parents[i].clone()
+    for i in range(4):
+        elite = parents8[i].clone()
         elite.trainable = True
         elites.append(elite)
 
     pop.extend(elites)
-
-    # pop size is now 256 + 4 = 260
     return pop
-
 
 def train_population_once(
     pop: List[Agent],
@@ -1856,6 +2341,7 @@ def train_population_once(
     env: BattledanceEnvironment,
     rnd: np.random.RandomState,
     use_worst_only: bool = False,
+    stop_event=None,
 ) -> Tuple[List[Agent], List[Agent], bool]:
     """
     Perform one evolutionary generation on `pop` using a two-stage
@@ -1895,6 +2381,7 @@ def train_population_once(
         opponents,
         env,
         n_per_colour=n1,
+        stop_event=stop_event,
     )
 
     # Build Stage-1 fitness scores
@@ -1925,6 +2412,7 @@ def train_population_once(
         n1_per_colour=n1,
         n2_per_colour=n2,
         use_worst_only=use_worst_only,
+        stop_event=stop_event,
     )
 
     if not ordered_indices:
@@ -1946,15 +2434,54 @@ def train_population_once(
     success = True
     parent_metrics: List[List[Tuple[str, int, int]]] = []
 
+    n_opps = len(opponents)
+
     for local_rank, idx in enumerate(parent_indices):
-        row_stats = snapshot_stats_2.get(idx, [])
+        row_stats = snapshot_stats_2.get(idx, None)
+
+        # Defensive: missing/short/corrupt stats must fail the gate.
+        if not isinstance(row_stats, list) or len(row_stats) != n_opps:
+            success = False
+            log(
+                f"[{CURRENT_AGENT_NAME}] cycle {CURRENT_CYCLE} gen {CURRENT_GEN}: "
+                f"WARNING: missing or invalid Stage-2 stats for parent idx={idx} "
+                f"(have {0 if not isinstance(row_stats, list) else len(row_stats)}, expected {n_opps}).",
+                also_print=False,
+            )
+            break
+
         row: List[Tuple[str, int, int]] = []
-        for snap_idx, (margin, draws) in enumerate(row_stats):
-            opp_name = opponents[snap_idx].name if snap_idx < len(opponents) else f"opp_{snap_idx}"
-            row.append((opp_name, margin, draws))
-            if margin < 0:
+        for snap_idx in range(n_opps):
+            opp_name = opponents[snap_idx].name
+
+            pair = row_stats[snap_idx]
+            if not (isinstance(pair, tuple) and len(pair) == 2):
+                success = False
+                log(
+                    f"[{CURRENT_AGENT_NAME}] cycle {CURRENT_CYCLE} gen {CURRENT_GEN}: "
+                    f"WARNING: corrupt Stage-2 stat tuple for parent idx={idx} vs {opp_name}.",
+                    also_print=False,
+                )
+                break
+
+            margin, draws = pair
+            try:
+                margin_i = int(margin)
+                draws_i = int(draws)
+            except Exception:
+                success = False
+                log(
+                    f"[{CURRENT_AGENT_NAME}] cycle {CURRENT_CYCLE} gen {CURRENT_GEN}: "
+                    f"WARNING: non-integer Stage-2 stats for parent idx={idx} vs {opp_name}.",
+                    also_print=False,
+                )
+                break
+
+            row.append((opp_name, margin_i, draws_i))
+            if margin_i < 0:
                 success = False
                 break
+
         parent_metrics.append(row)
         if not success:
             break
@@ -1992,6 +2519,7 @@ def run_champion_matches(
     cycle: int,
     env: BattledanceEnvironment,
     outfile_path: str,
+    stop_event=None,
 ) -> None:
     """
     Run champion matches for a single agent `name` immediately after its GA
@@ -2052,7 +2580,7 @@ def run_champion_matches(
     total_games = len(schedule)
     if total_games == 0:
         log(f"[{name}] cycle {cycle}: no opponent snapshots available for champion matches.")
-        print()
+        status_newline()
         return
 
     os.makedirs(os.path.dirname(outfile_path), exist_ok=True)
@@ -2067,8 +2595,9 @@ def run_champion_matches(
     progress["cycle"] = cycle
     progress["next_index"] = next_index
     save_champion_progress(base_dir, name, progress)
-
-    # Truncate this agent's log file to the first `next_index` complete games
+    check_stop(stop_event)
+    # Truncate this agent's log file to the first `next_index` complete games,
+    # robustly: scan for header lines and take the following moves line.
     existing: List[str] = []
     if os.path.exists(outfile_path):
         try:
@@ -2077,10 +2606,24 @@ def run_champion_matches(
         except Exception:
             existing = []
 
-    # Two lines per complete game: header + moves
-    max_pairs = len(existing) // 2
-    completed_pairs = min(next_index, max_pairs)
-    trimmed: List[str] = existing[: 2 * completed_pairs]
+    games: List[Tuple[str, str]] = []
+    i = 0
+    while i + 1 < len(existing):
+        line = existing[i]
+        if line.startswith("Cycle: "):
+            header = existing[i]
+            moves = existing[i + 1]
+            games.append((header, moves))
+            i += 2
+        else:
+            # Skip stray/extra lines (future-proofing)
+            i += 1
+
+    completed_games = min(next_index, len(games))
+    trimmed: List[str] = []
+    for header, moves in games[:completed_games]:
+        trimmed.append(header)
+        trimmed.append(moves)
 
     try:
         with open(outfile_path, "w", encoding="utf-8") as f:
@@ -2093,6 +2636,7 @@ def run_champion_matches(
     # Replay / resume over the schedule.
     game_index = 0
     for opp_name, s, color in schedule:
+        check_stop(stop_event)
         # Skip games already recorded as completed.
         if game_index < next_index:
             game_index += 1
@@ -2139,58 +2683,87 @@ def run_champion_matches(
         # Update champion_progress after each completed game
         progress["next_index"] = game_index
         save_champion_progress(base_dir, name, progress)
-
+        check_stop(stop_event)
     # Clean up the status line with a newline at the end of champion matches
-    print()
-
+    status_newline()
 
 def play_game_with_moves(agent1: Agent, agent2: Agent, env: BattledanceEnvironment) -> Tuple[int, str]:
     """
-    Play a single game between agents and return (result, moves_str).
-
     result:
       +1 = agent1 (as White) wins
       -1 = agent2 (as Black) wins
        0 = draw
 
     moves_str:
-      comma-separated list of moves in notation like "Pc2-c4" or "P-@-b2" for drops.
+      fixed-width chunks: "<move><mark><space>"
+        mark: ',' normal, '+' gives check, '#' ends game (bishop capture OR mate-by-no-legal-move)
+              '=' draw
     """
     board = env.initial_board.copy()
     players = {'w': agent1, 'b': agent2}
+
     moves_list: List[str] = []
+    marks_after: List[str] = []  # one char per move: ',', '+', '#', '='
 
     while True:
         color = board.turn
+        enemy = 'b' if color == 'w' else 'w'
         agent = players[color]
 
         mv = agent.choose_move(board)
         if mv is None:
-            # no legal moves (stalemate is loss for side to move)
+            # Side to move loses in your rules.
             loser = color
             result = 1 if loser == 'b' else -1
+
+            # Retroactively mark the previous move as a terminal '#'
+            if marks_after:
+                marks_after[-1] = '#'
             break
 
-        # Record move in notation
+        # Build notation from the *current* board before applying the move.
         if mv.kind == 'move':
             fr, fc = mv.from_pos
             tr, tc = mv.to_pos
-            move_str = f"{board.board[fr][fc].kind}{chr(97 + fc)}{8 - fr}-{chr(97 + tc)}{8 - tr}"
+            piece = board.board[fr][fc]
+            target = board.board[tr][tc]
+
+            sep = 'x' if target is not None else '-'
+            move_str = (
+                f"{piece.kind}"
+                f"{chr(97 + fc)}{8 - fr}"
+                f"{sep}"
+                f"{chr(97 + tc)}{8 - tr}"
+            )
         else:
-            # drop notation: X-@-sq
             tr, tc = mv.to_pos
             move_str = f"{mv.drop_type}-@-{chr(97 + tc)}{8 - tr}"
-        moves_list.append(move_str)
 
         winner = board.apply_move(mv)
+
+        # Compute draw exactly once.
+        draw = False if winner is not None else board.check_draw()
+
+        # Default mark logic (must be 1 char; never lengthen move_str)
+        if winner is not None:
+            mark = '#'
+        elif draw:
+            mark = '='
+        else:
+            mark = '+' if board.is_in_check(enemy) else ','
+
+        moves_list.append(move_str)
+        marks_after.append(mark)
+
         if winner is not None:
             result = 1 if winner == 'w' else -1
             break
-        if board.check_draw():
+        if draw:
             result = 0
             break
 
-    return result, ', '.join(moves_list)
+    moves_str = "".join(f"{m}{k} " for m, k in zip(moves_list, marks_after))
+    return result, moves_str
 
 ###############################################################################
 #  Per-agent training helper (for single- and multi-thread modes)
@@ -2202,6 +2775,8 @@ def train_single_agent(
     base_dir: str,
     cycle: int,
     seed: int,
+    env: Optional[BattledanceEnvironment] = None,
+    stop_event=None,
 ) -> int:
     """
     Train a single agent `name` for the given cycle until GA success.
@@ -2247,7 +2822,10 @@ def train_single_agent(
     # Fresh RNG for this agent/process
     rnd = np.random.RandomState(seed)
 
-    env = BattledanceEnvironment()
+    if env is None:
+        env = BattledanceEnvironment()
+    check_stop(stop_event)
+
 
     # Try to resume GA from a saved full population in `_0`.
     population: List[Agent]
@@ -2283,9 +2861,12 @@ def train_single_agent(
             )
             seeds: List[Agent] = []
             for _ in range(4):
-                a = Agent(name)
-                a.net = MLP(input_dim=594, hidden_dim=512, seed=rnd.randint(0, 2**31 - 1))
-                a.trainable = True
+                net_seed = int(rnd.randint(0, 2**31 - 1))
+                a = Agent(
+                    name=name,
+                    net=MLP(input_dim=594, hidden_dim=512, seed=net_seed),
+                    trainable=True,
+                )
                 seeds.append(a)
 
             parents_seed: List[Agent] = []
@@ -2313,6 +2894,12 @@ def train_single_agent(
                         continue
                 opponents.append(champ)
     log(f"[{name}] cycle {cycle}: loaded {len(opponents)} opponent snapshots.")
+    # If the spec says we should have opponents but none loaded, treat as fatal.
+    if opponent_lists.get(name) and len(opponents) == 0:
+        raise RuntimeError(
+            f"[{name}] cycle {cycle}: expected opponent snapshots but loaded none. "
+            f"Check that {base_dir} contains <Opp>_1.pkl/<Opp>_2.pkl/<Opp>_3.pkl for listed opponents."
+        )
 
     # Train population until success
     gen = gen_start
@@ -2321,6 +2908,7 @@ def train_single_agent(
     parents = []
 
     while not success:
+        check_stop(stop_event)
         gen += 1
         CURRENT_GEN = gen
         # Use worst-case-only fitness every 1024 unsuccessful generations
@@ -2331,11 +2919,13 @@ def train_single_agent(
             env,
             rnd,
             use_worst_only=use_worst,
+            stop_event=stop_event,
         )
 
         # Persist the full population to `_0` after each generation so we
         # can resume GA without rebuilding it.
         save_population_state(name, population, gen, base_dir)
+        check_stop(stop_event)
 
         status_str = "success" if success else "continue"
         suffix = " (worst-only fitness)" if use_worst else ""
@@ -2366,6 +2956,9 @@ def train_group_agent_sequence(
     base_dir: str,
     cycle: int,
     name_to_seed: Dict[str, int],
+    status_queue: Optional[object] = None,
+    log_queue: Optional[object] = None,
+    stop_event=None,
 ) -> None:
     """
     Worker entry point for a single OS process responsible for one group
@@ -2383,43 +2976,55 @@ def train_group_agent_sequence(
     The caller ensures that group_names only contains agents that still
     need training for this cycle.
     """
-    # Each process gets its own logging header; harmless duplication.
-    setup_logging(base_dir, cycle)
+    # Redirect status + logging to the main process before any output.
+    init_ipc(status_queue, log_queue)
 
     # Single environment reused for champion matches in this process
     env = BattledanceEnvironment()
 
-    for name in group_names:
-        seed = name_to_seed.get(name, 0)
 
-        # Train this agent until GA success; saves parents to Name_0.pkl
-        train_single_agent(name, opponent_lists, base_dir, cycle, seed)
-
-        # Load parents (8 nets) from Name_0.pkl for champion matches
-        pop_path = os.path.join(base_dir, f"{name}_0.pkl")
-        parents = load_parents(pop_path)
-        if not parents:
-            log(
-                f"[{name}] cycle {cycle}: WARNING: parents missing after GA success; "
-                f"skipping champion matches for this agent.",
+    try:
+        for name in group_names:
+            check_stop(stop_event)
+    
+            seed = name_to_seed.get(name, 0)
+    
+            # Train this agent until GA success; saves parents to Name_0.pkl
+            train_single_agent(name, opponent_lists, base_dir, cycle, seed, env=env, stop_event=stop_event)
+    
+            check_stop(stop_event)
+    
+            # Load parents (8 nets) from Name_0.pkl for champion matches
+            pop_path = os.path.join(base_dir, f"{name}_0.pkl")
+            parents = load_parents(pop_path)
+            if not parents:
+                log(
+                    f"[{name}] cycle {cycle}: WARNING: parents missing after GA success; "
+                    f"skipping champion matches for this agent.",
+                )
+                continue
+    
+            # Per-agent champion match log
+            champ_log_path = os.path.join(base_dir, f"champion_matches_{name}.txt")
+    
+            # Run champion matches immediately after training this agent
+            run_champion_matches(
+                name,
+                parents,
+                opponent_lists,
+                base_dir,
+                cycle,
+                env,
+                champ_log_path,
+                stop_event=stop_event,
             )
-            continue
-
-        # Per-agent champion match log
-        champ_log_path = os.path.join(base_dir, f"champion_matches_{name}.txt")
-
-        # Run champion matches immediately after training this agent
-        run_champion_matches(
-            name,
-            parents,
-            opponent_lists,
-            base_dir,
-            cycle,
-            env,
-            champ_log_path,
-        )
-
-
+    except GracefulStop:
+        # Exit cleanly (no worker failure) so the main process can leave the cycle incomplete.
+        log("[global] Graceful stop: worker exiting cleanly.")
+        status_newline()
+        return
+    
+    
 ###############################################################################
 #  Main training loop and rotation
 ###############################################################################
@@ -2534,8 +3139,16 @@ def run_training_cycle(
         if g:
             grouped_agents.append(g)
 
+
+    # ------------------------------------------------------------------
+    # Graceful stop: main-process listener + shared stop flag for workers.
+    # ------------------------------------------------------------------
+    stop_event = threading.Event() if thread_mode == "1" else multiprocessing.Event()
+
     if thread_mode == "1":
         # Single-process mode: run groups inline, no multiprocessing.
+        start_stop_listener(stop_event)
+        install_sigint_as_graceful(stop_event)
         for group in grouped_agents:
             group_seed_map = {name: name_to_seed[name] for name in group}
             train_group_agent_sequence(
@@ -2544,28 +3157,172 @@ def run_training_cycle(
                 base_dir,
                 cycle,
                 group_seed_map,
+                stop_event=stop_event,
             )
+
+        # If a graceful stop was requested, leave this cycle incomplete.
+        if stop_event.is_set():
+            log(f"[global] cycle {cycle}: graceful stop requested; leaving cycle incomplete (no rotation).")
+            save_cycle_progress(base_dir, progress)
+            return False
+
+
     else:
-        # Spawn one process per non-empty group.
+        status_queue = multiprocessing.Queue()
+        log_queue = multiprocessing.Queue()
+
+        # Route main-process status() and log() through the queues too.
+        global STATUS_QUEUE, LOG_QUEUE
+        STATUS_QUEUE = status_queue
+        LOG_QUEUE = log_queue
+
+        stdout_lock = threading.Lock()
+        status_text = {"line": "", "len": 0}  # shared state between consumer threads
+
+        def _render_status_locked(line: str) -> None:
+            line = (line or "")[:200]
+            sys.stdout.write("\r" + line)
+            if status_text["len"] > len(line):
+                sys.stdout.write(" " * (status_text["len"] - len(line)))
+                sys.stdout.write("\r" + line)
+            sys.stdout.flush()
+            status_text["line"] = line
+            status_text["len"] = len(line)
+
+        def _erase_status_locked() -> None:
+            """Erase the currently rendered status from the terminal (do not forget it)."""
+            if status_text["len"] > 0:
+                sys.stdout.write("\r" + (" " * status_text["len"]) + "\r")
+                sys.stdout.flush()
+
+        def _consume_status_queue() -> None:
+            while True:
+                try:
+                    pid, msg = status_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                except Exception:
+                    continue
+
+                if msg == "__STOP__":
+                    break
+
+                with stdout_lock:
+                    if msg is None:
+                        # newline request
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        status_text["line"] = ""
+                        status_text["len"] = 0
+                    else:
+                        _render_status_locked(msg)
+
+        def _consume_log_queue() -> None:
+            while True:
+                try:
+                    pid, line, also_print = log_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                except Exception:
+                    continue
+
+                if line == "__STOP__":
+                    break
+
+                # File I/O always happens here (single writer).
+                if LOG_PATH is not None:
+                    try:
+                        with open(LOG_PATH, "a", encoding="utf-8") as f:
+                            f.write(line + "\n")
+                    except Exception:
+                        pass
+
+                # Console printing: clear status, print log line, re-render status.
+                if also_print:
+                    with stdout_lock:
+                        saved = status_text["line"]
+                        _erase_status_locked()
+                        sys.stdout.write(line + "\n")
+                        # If the status bar is active and this is a global log line,
+                        # leave a blank line so subsequent '\r' updates can't visually
+                        # appear to overwrite the log.
+                        if saved and "[global]" in line:
+                            sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        if saved:
+                            _render_status_locked(saved)
+
+        consumer_thread = threading.Thread(target=_consume_status_queue, daemon=True)
+        log_consumer_thread = threading.Thread(target=_consume_log_queue, daemon=True)
+
         processes: List[multiprocessing.Process] = []
-        for idx, group in enumerate(grouped_agents):
-            group_seed_map = {name: name_to_seed[name] for name in group}
-            p = multiprocessing.Process(
-                target=train_group_agent_sequence,
-                args=(group, opponent_lists, base_dir, cycle, group_seed_map),
-                name=f"BDGroup-{idx+1}",
-            )
-            processes.append(p)
 
-        # Start all workers.
-        for p in processes:
-            p.start()
+        try:
+            consumer_thread.start()
+            log_consumer_thread.start()
+            start_stop_listener(stop_event)
+            install_sigint_as_graceful(stop_event)
 
-        # Wait for all workers to finish their entire group workload.
-        for p in processes:
-            p.join()
 
-        # If any worker died, leave progress as-is so this cycle can be safely retried.
+            for idx, group in enumerate(grouped_agents):
+                group_seed_map = {name: name_to_seed[name] for name in group}
+                p = multiprocessing.Process(
+                    target=train_group_agent_sequence,
+                    args=(group, opponent_lists, base_dir, cycle, group_seed_map, status_queue, log_queue, stop_event),
+                    name=f"BDGroup-{idx+1}",
+                )
+                processes.append(p)
+
+            for p in processes:
+                p.start()
+
+            for p in processes:
+                p.join()
+
+        finally:
+            # Stop consumers and restore globals no matter what.
+            try:
+                # Ensure we end on a clean line.
+                status_queue.put_nowait((os.getpid(), None))
+            except Exception:
+                pass
+
+            try:
+                status_queue.put_nowait((os.getpid(), "__STOP__"))
+            except Exception:
+                pass
+
+            try:
+                log_queue.put_nowait((os.getpid(), "__STOP__", False))
+            except Exception:
+                pass
+
+            try:
+                consumer_thread.join(timeout=2.0)
+            except Exception:
+                pass
+
+            try:
+                log_consumer_thread.join(timeout=2.0)
+            except Exception:
+                pass
+
+            # Revert to direct logging (important: do this before any further log() calls).
+            STATUS_QUEUE = None
+            LOG_QUEUE = None
+
+            try:
+                status_queue.close()
+                status_queue.join_thread()
+            except Exception:
+                pass
+
+            try:
+                log_queue.close()
+                log_queue.join_thread()
+            except Exception:
+                pass
+
         failed = [p.name for p in processes if p.exitcode not in (0, None)]
         if failed:
             log(
@@ -2575,14 +3332,26 @@ def run_training_cycle(
             save_cycle_progress(base_dir, progress)
             return False
 
+
+    # If a graceful stop was requested, do NOT mark agents done; leave the cycle incomplete.
+    if stop_event.is_set():
+        log(f"[global] cycle {cycle}: graceful stop requested; leaving cycle incomplete (no rotation).")
+        save_cycle_progress(base_dir, progress)
+        return False
+
     # Mark all trained agents as "done" in cycle_progress, since champion
     # matches have already been run per-agent inside the workers.
     for name in agents_to_train:
         entry = agents_progress.get(name, {"state": "pending"})
         entry["state"] = "done"
         entry["last_cycle"] = cycle
-        # last_gen is not used elsewhere; preserve if present, else set -1.
-        entry["last_gen"] = entry.get("last_gen", -1)
+
+        done_state = load_ga_done_state(base_dir, name)
+        if isinstance(done_state, dict) and done_state.get("cycle") == cycle:
+            entry["last_gen"] = int(done_state.get("last_gen", -1) or -1)
+        else:
+            entry["last_gen"] = int(entry.get("last_gen", -1) or -1)
+
         agents_progress[name] = entry
 
     progress["agents"] = agents_progress
@@ -2590,27 +3359,12 @@ def run_training_cycle(
 
     return True
 
-
 def rotate_snapshots(agent_names: List[str], base_dir: str) -> None:
     """
     Perform snapshot rotation after all agents have completed their cycle
     training and champion matches.
 
-    Before rotation (after finishing cycle c), for each agent Name:
-      * Name_0: 8 parents from cycle c (including the cycle-c champion).
-      * Name_1: 8 parents from cycle c-1 (including the cycle-(c-1) champion).
-      * Name_2: single champion from cycle c-2 (if it exists).
-      * Name_3: single champion from cycle c-3 (if it exists).
-
-    After rotation:
-      * Name_3: single champion that used to be in Name_2
-                (i.e. champion from cycle c-2).
-      * Name_2: champion extracted from Name_1's 8 parents
-                (i.e. champion from cycle c-1).
-      * Name_1: the 8 parents from Name_0 (i.e. parents from cycle c).
-      * Name_0: left as the pruned 8-parent set from cycle c; a fresh GA
-                population will be built to disk from Name_0 when the
-                next cycle starts.
+    This version is defensive: filesystem hiccups must not crash training.
     """
     for name in agent_names:
         path0 = os.path.join(base_dir, f"{name}_0.pkl")
@@ -2619,54 +3373,55 @@ def rotate_snapshots(agent_names: List[str], base_dir: str) -> None:
         path3 = os.path.join(base_dir, f"{name}_3.pkl")
 
         # 1) Discard old _3
-        if os.path.exists(path3):
-            os.remove(path3)
-            log(f"[{name}] rotation: removed old {path3}", also_print=False)
+        try:
+            if os.path.exists(path3):
+                os.remove(path3)
+                log(f"[{name}] rotation: removed old {path3}", also_print=False)
+        except Exception as e:
+            log(f"[{name}] rotation: WARNING: could not remove {path3}: {e}", also_print=False)
 
-        # 2) Move current _2 champion to _3 (if present)
-        champ_from_2 = load_champion(path2)
-        if champ_from_2 is not None:
-            save_champion(champ_from_2, path3)
-            log(f"[{name}] rotation: moved champion from _2 to _3.", also_print=False)
+        # 2) Move _2 champion to _3 (copy semantics)
+        try:
+            champ_from_2 = load_champion(path2)
+            if champ_from_2 is not None:
+                save_champion(champ_from_2, path3)
+                log(f"[{name}] rotation: moved champion from _2 to _3.", also_print=False)
+        except Exception as e:
+            log(f"[{name}] rotation: WARNING: _2 -> _3 failed: {e}", also_print=False)
 
-        # 3) Extract prior-cycle champion from _1 into _2
-        parents_prev = load_parents(path1)
-        if parents_prev:
-            champ_prev = parents_prev[0]
-            save_champion(champ_prev, path2)
-            log(f"[{name}] rotation: extracted champion from _1 into _2.", also_print=False)
+        # 3) Extract champion from _1 into _2
+        try:
+            parents_prev = load_parents(path1)
+            if parents_prev:
+                save_champion(parents_prev[0], path2)
+                log(f"[{name}] rotation: extracted champion from _1 into _2.", also_print=False)
+        except Exception as e:
+            log(f"[{name}] rotation: WARNING: _1 -> _2 failed: {e}", also_print=False)
 
-        # 4) Move this cycle's parents (from _0) into _1
-        parents_this = load_parents(path0)
-        if parents_this:
-            save_parents(parents_this, path1)
-            log(f"[{name}] rotation: copied parents from _0 into _1.", also_print=False)
+        # 4) Copy _0 parents into _1
+        try:
+            parents_this = load_parents(path0)
+            if parents_this:
+                save_parents(parents_this, path1)
+                log(f"[{name}] rotation: copied parents from _0 into _1.", also_print=False)
+        except Exception as e:
+            log(f"[{name}] rotation: WARNING: _0 -> _1 failed: {e}", also_print=False)
 
 
 def update_cycle_counter(base_dir: str) -> int:
-    """Increment cycle counter in state file and return new cycle value."""
-    state_path = os.path.join(base_dir, 'training_state.json')
-    data = {'cycle': 0}
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = {'cycle': 0}
-        except Exception:
-            data = {'cycle': 0}
+    state_path = os.path.join(base_dir, "training_state.json")
+    data = _safe_read_json(state_path)
+    if not isinstance(data, dict):
+        data = {"cycle": 0}
 
-    data['cycle'] = int(data.get('cycle', 0) or 0) + 1
+    data["cycle"] = int(data.get("cycle", 0) or 0) + 1
 
     try:
-        with open(state_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
+        _safe_write_json(state_path, data, indent=2, durable=True)
     except Exception:
-        # Failing to persist the counter should not crash training.
         pass
 
-    return data['cycle']
-
+    return int(data["cycle"])
 
 def initialize_agents(agent_names: List[str], base_dir: str) -> None:
     """
@@ -2693,9 +3448,12 @@ def initialize_agents(agent_names: List[str], base_dir: str) -> None:
         # 4 Xavier seeds
         seeds: List[Agent] = []
         for _ in range(4):
-            a = Agent(name)
-            a.net = MLP(input_dim=594, hidden_dim=512, seed=rnd.randint(0, 2**31 - 1))
-            a.trainable = True
+            net_seed = int(rnd.randint(0, 2**31 - 1))
+            a = Agent(
+                name=name,
+                net=MLP(input_dim=594, hidden_dim=512, seed=net_seed),
+                trainable=True,
+            )
             seeds.append(a)
 
         # 4 straight copies as additional parents
@@ -2722,17 +3480,19 @@ def initialize_agents(agent_names: List[str], base_dir: str) -> None:
         save_champion(champ_s2, os.path.join(base_dir, f"{name}_2.pkl"))
         save_champion(champ_s3, os.path.join(base_dir, f"{name}_3.pkl"))
 
-    # Write initial state
-    with open(state_path, 'w') as f:
-        json.dump({'cycle': 0}, f)
+    # Write initial state (atomic)
+    try:
+        _safe_write_json(state_path, {"cycle": 0}, indent=2, durable=True)
+    except Exception:
+        pass
+
 
 
 def main() -> None:
     # Define agent names and opponent lists
     agent_names = [
-        "Red", "Grn", "Blu", "Cyn", "Mag", "Yel",
-        "NoN", "deR", "nrG", "ulB", "nyC", "gaM",
-        "leY", "XyZ", "ZyX",
+        "Red", "Grn", "Blu", "Cyn", "Mag", "Yel", "NoN",
+        "deR", "nrG", "ulB", "nyC", "gaM", "leY", "XyZ", "ZyX",
     ]
     opponent_lists: Dict[str, List[str]] = {
         "Red": ["NoN", "Grn", "ulB", "Cyn", "gaM", "Yel", "ZyX", "Red"],
@@ -2749,8 +3509,8 @@ def main() -> None:
         "gaM": ["deR", "Grn", "Blu", "nyC", "Mag", "Yel", "ZyX", "gaM"],
         "leY": ["Red", "nrG", "Blu", "Cyn", "gaM", "Yel", "ZyX", "leY"],
         "XyZ": [
-            "Red", "Grn", "Blu", "Cyn", "Mag", "Yel",
-            "NoN", "deR", "nrG", "ulB", "nyC", "gaM", "leY", "XyZ",
+                "Red", "Grn", "Blu", "Cyn", "Mag", "Yel", "NoN",
+                "deR", "nrG", "ulB", "nyC", "gaM", "leY", "XyZ",
         ],
         "ZyX": ["XyZ", "ZyX"],
     }
@@ -2772,18 +3532,11 @@ def main() -> None:
     # Initialise agents on first run only
     initialize_agents(agent_names, base_dir)
 
-    # Read current cycle from state, robust against partial/corrupt JSON.
+    # Read current cycle from state, robust against partial/corrupt JSON (+ .bak fallback).
     state_path = os.path.join(base_dir, "training_state.json")
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                cycle = int(data.get("cycle", 0) or 0)
-            else:
-                cycle = 0
-        except Exception:
-            cycle = 0
+    state_obj = _safe_read_json(state_path)
+    if isinstance(state_obj, dict):
+        cycle = int(state_obj.get("cycle", 0) or 0)
     else:
         cycle = 0
 
