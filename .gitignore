@@ -1,0 +1,6 @@
+models/
+ga_progress/
+sample_games/
+__pycache__/
+*.pyc
+*.tmp.*
