@@ -1,65 +1,27 @@
-# Battledance Chess MLP-GA Trainer
+# Battledance Chess + MLP-GA Trainer
 
 This repository contains two connected things:
 
 1. **Battledance Chess** — a custom chesslike board game.
-2. **An MLP-GA trainer** — a program that tries to evolve neural-network players for that game.
+2. **A neural-network trainer** — a long-running program that tries to evolve computer players for that game.
 
-The trainer does not use human game records, opening books, or hand-written strategy. It creates many simple neural networks, lets them play Battledance Chess, keeps the better performers, mutates and recombines them, and repeats.
+The trainer does not use human game records, opening books, or hand-written strategy. It creates many simple neural networks, lets them play Battledance Chess, keeps the better performers, mixes and mutates them, and repeats.
 
-The short version:
+In one line:
 
 ```text
-Battledance Chess = the game.
-MLP = a small feed-forward neural network that scores board positions.
-GA = a genetic algorithm that breeds better networks from better performers.
+Battledance Chess is the game; the MLP-GA trainer is the experiment that breeds neural players for it.
 ```
 
-This is experimental toy/research code. It is built to run for a long time, save progress often, and resume after ordinary interruptions.
+This is experimental toy/research code. It is meant to run for a long time, save progress often, and resume after ordinary interruptions.
 
 ---
 
-## Quick start
+## Battledance Chess in plain English
 
-Install dependencies:
+Battledance Chess is played on an **8×8 board**. It looks chesslike, but the pieces and rules are custom.
 
-```bash
-pip install -r requirements.txt
-```
-
-If the requirements file is not present, the important package is:
-
-```bash
-pip install numpy
-```
-
-Run the trainer:
-
-```bash
-python battledance_training.py
-```
-
-Request a graceful stop while it is running:
-
-```text
-q
-```
-
-On some terminals, use `q` and then Enter. The program finishes the current game, saves progress, and exits without pretending the current cycle is complete.
-
-To resume, run the same command again:
-
-```bash
-python battledance_training.py
-```
-
----
-
-## The game in one page
-
-Battledance Chess is played on an **8×8 board**. It looks like chess, but the pieces and capture rules are custom.
-
-Each side starts with two rows of pieces. White uses uppercase letters. Black uses lowercase letters.
+Each player starts with two rows of pieces:
 
 ```text
 xx a= b= c= d= e= f= g= h= xx
@@ -74,25 +36,35 @@ xx a= b= c= d= e= f= g= h= xx
 xx a= b= c= d= e= f= g= h= xx
 ```
 
+Uppercase pieces are **White**. Lowercase pieces are **Black**.
+
+The leading `.` and `,` characters are only square-color markers for the text board. For example, `.K` means a `K` piece on one square color, `,K` means a `K` piece on the other square color, and `..` or `,,` means an empty square.
+
 The internal starting-position string is:
 
 ```text
 rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
 ```
 
-### Objective
+![Battledance Chess starting 2 ranks](concept.png)
+
+---
+
+## Objective
 
 The **Bishop** is royal. Capturing any opposing Bishop wins immediately.
 
 A player also loses if they have no legal moves.
 
-If a Bishop capture is available, the engine treats Bishop-capturing moves as the only legal moves for that turn. In practice: if you can take a royal Bishop, you must end the game.
+One important rule: if a Bishop capture is available, the engine treats Bishop-capturing moves as the only legal moves for that turn. In practice, if you can take a royal Bishop, you must end the game.
 
-### Pieces
+---
 
-Most pieces are **leapers**: they jump directly to a target square. A leaper may land on an empty square or capture an enemy piece, but it may not land on a friendly piece.
+## Pieces and movement
 
-Leaps are symmetric. For example, a `(2,1)` leap means every reflected/rotated version of that shape, like a chess knight.
+Most pieces are **leapers**. A leaper jumps directly to its destination. It may land on an empty square or capture an enemy piece. It may not land on a friendly piece.
+
+Movement pairs such as `(2,1)` describe a jump shape: two squares in one direction and one square sideways. Leap directions are symmetric, so `(2,1)` includes every reflected and rotated version of that jump, like a chess knight.
 
 | Letter | Name | Movement |
 |---|---|---|
@@ -105,15 +77,17 @@ Leaps are symmetric. For example, a `(2,1)` leap means every reflected/rotated v
 | `R` | Rook | Slides orthogonally, like a chess rook |
 | `B` | Bishop | Slides diagonally, like a chess bishop; also royal |
 
-A sliding piece keeps moving in one legal direction until it stops, captures, or hits the edge of the board.
+A sliding piece keeps moving in a straight legal direction until it stops, captures, is blocked, or reaches the edge of the board.
 
-### Check and legal moves
+The small 7×7 movement grid in this repository is a visual reference for the short-range leap classes, centered on `(0,0)`. It is not the game board.
 
-A side may not make a move that leaves its own Bishop attacked.
+![7x7 move-class grid](battledance-chess-move-display.png)
 
-Because each side starts with two Bishops, this means both royal Bishops matter. Losing either opposing Bishop wins the game, and exposing your own Bishop is illegal.
+---
 
-### Captures and drops
+## Check, captures, and drops
+
+A side may not make a move that leaves its own Bishop attacked. Because each side starts with two Bishops, both royal Bishops matter.
 
 When a player captures a **non-Bishop** piece, that piece goes into the capturing player’s hand.
 
@@ -124,9 +98,11 @@ White home rows: ranks 1 and 2
 Black home rows: ranks 7 and 8
 ```
 
-Drops do not capture. They place a held piece back onto the board.
+Drops do not capture. They simply place a held piece back onto the board.
 
-### Draws
+---
+
+## Draws
 
 The engine declares a draw by any of these rules:
 
@@ -136,15 +112,15 @@ threefold repetition
 4096 total plies
 ```
 
-A **ply** is one individual turn by one player. So 128 plies equals 64 full moves.
+A **ply** is one turn by one player. So 128 plies equals 64 full moves.
 
 ---
 
-## What the neural player is doing
+## What the neural player does
 
 Each neural network is a board evaluator.
 
-It does not understand the game in words. It receives a list of numbers describing the position, then outputs one score.
+It does not understand the rules in words. The program converts the board into numbers, gives those numbers to the network, and receives one score back.
 
 The default board encoding has **594 numbers**:
 
@@ -152,7 +128,7 @@ The default board encoding has **594 numbers**:
 piece locations
 pieces in hand
 side to move
-draw/repetition counters
+draw and repetition counters
 ```
 
 The default network shape is:
@@ -164,28 +140,31 @@ The default network shape is:
 That means:
 
 ```text
-594 inputs
+594 input numbers
 three hidden layers of 512 values each
 1 output score
 ```
 
-The hidden layers use `tanh`, so values are pushed into a smooth `-1` to `+1` range.
+The network uses `tanh`, which keeps layer values in a smooth `-1` to `+1` range.
 
 When choosing a move, the agent:
 
-1. lists its legal moves;
+1. lists all legal moves;
 2. temporarily plays each move;
 3. evaluates the resulting board;
-4. gives immediate wins a huge score and terminal draws a neutral score;
-5. chooses randomly among the high-scoring moves, weighted toward the better ones.
+4. gives immediate wins a huge score;
+5. treats terminal draws as neutral;
+6. randomly chooses among the high-scoring moves, weighted toward the better ones.
 
-That last bit matters. The agent is not perfectly deterministic, so repeated games between the same two networks can still differ.
+It is not doing deep chess-engine search. It is using one-move lookahead plus its learned board evaluator.
+
+The random weighted choice matters: repeated games between the same two networks can still differ.
 
 ---
 
-## Neuroevolution, in plain English
+## Neuroevolution, without jargon
 
-This trainer does **not** use backpropagation. It does not compare the network’s move to a known correct answer.
+This trainer does **not** use backpropagation. It does not know the “correct” move for a position.
 
 Instead, it uses survival pressure:
 
@@ -194,42 +173,29 @@ make many networks
 let them play games
 score their results
 keep the better ones
-breed new networks from them
+make children from them
 mutate the children
 repeat
 ```
 
-That is the “GA” part: Genetic Algorithm.
+That is the **GA**, or Genetic Algorithm, part.
 
-The networks are not breeding because they are alive. It just means the program copies numbers from parent networks into child networks, then randomly tweaks some of those numbers.
+The networks are not alive. “Genetic” just means the program treats each network’s weights and biases like inheritable numbers.
 
-### Crossover
+Common terms in this project:
 
-A child network is built from two parents. For each weight or bias, the child gets that value from one parent or the other.
+| Term | Meaning here |
+|---|---|
+| **Network** | A board-scoring function made of many numeric weights and biases. |
+| **Population** | A group of candidate networks being tested. |
+| **Fitness** | How well a candidate performs in games. |
+| **Selection** | Keeping the better candidates as parents. |
+| **Crossover** | Building a child by taking values from two parents. |
+| **Mutation** | Randomly nudging some values in the child. |
+| **Elite** | A strong parent copied forward directly. |
+| **Snapshot** | A saved network or saved parent set from a past point in training. |
 
-Plainly:
-
-```text
-child = mixed copy of parent A and parent B
-```
-
-### Mutation
-
-After crossover, some values are randomly nudged.
-
-The default mutation rate is:
-
-```text
-1/256
-```
-
-So each individual weight or bias has a small chance to be changed.
-
-### Selection
-
-After candidates play games, the trainer keeps the strongest candidates as parents for the next generation.
-
-A network is not judged only by one lucky win. It is judged across many games against configured opponent snapshots.
+The aim is simple: networks that perform better are more likely to influence the next generation.
 
 ---
 
@@ -292,7 +258,7 @@ _2 -> _3
 _3 -> _4
 ```
 
-The rotation is designed to be resumable. If an interruption happens partway through rotation, the script uses its saved rotation plan rather than guessing.
+The rotation is plan-based and verified. If an interruption happens partway through rotation, the script uses its saved rotation plan rather than guessing from possibly half-rotated files.
 
 ---
 
@@ -330,21 +296,74 @@ Stage 1: test every candidate with a smaller game budget.
 Stage 2: spend more games only on the best finalists.
 ```
 
-The success gate is strict: the chosen parents must have non-negative margins against every required opponent snapshot at the configured evaluation depth. A candidate that is great on average but clearly loses to one required opponent can fail the gate.
+The success gate is strict: the chosen parents must have non-negative margins against every required opponent snapshot at the configured evaluation depth. A candidate that is strong on average but clearly loses to one required opponent can fail the gate.
 
 ---
 
-## Files and generated output
+## Running the trainer
 
-Main repository files:
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+The current dependency list is intentionally small:
+
+```text
+numpy>=1.24
+```
+
+Run the trainer:
+
+```bash
+python battledance_training.py
+```
+
+Request a graceful stop while it is running:
+
+```text
+q
+```
+
+On some terminals, type `q` and then Enter. The program finishes the current game, saves progress, and exits without pretending the current cycle is complete.
+
+To resume, run the same command again:
+
+```bash
+python battledance_training.py
+```
+
+Useful optional commands:
+
+```bash
+python battledance_training.py --threads-mode 5
+python battledance_training.py --prelude-workers 5
+python battledance_training.py --prelude-rounds 8
+python -S -m py_compile battledance_training.py
+```
+
+---
+
+## Files in the repository
+
+Main files:
 
 ```text
 battledance_training.py   Game engine and training program.
 training_config.ini       Editable defaults for fresh runs.
 README.md                 This explanation.
-LICENSE.txt               GPL-3.0-or-later license text.
-requirements.txt          Python dependencies, if present.
+LICENSE                   GPL-3.0-or-later license text.
+requirements.txt          Python dependency list.
 .gitignore                Suggested ignores for generated files.
+```
+
+Visual reference files:
+
+```text
+battledance_start_ascii_black_grid.png
+battledance-chess-move-display.png
+concept.png
 ```
 
 Runtime directories are created beside the script:
@@ -355,7 +374,7 @@ ga_progress/   Frequently updated progress JSON files.
 sample_games/  Champion game logs and round-robin result matrices.
 ```
 
-These generated directories can become large. They should normally stay out of Git.
+These generated directories can become large and should normally stay out of Git.
 
 Recommended `.gitignore` entries:
 
@@ -382,7 +401,7 @@ sample_games/
 
 Once a run exists, do not manually edit, move, delete, or replace generated files unless you are intentionally abandoning or repairing that run.
 
-The script is conservative. If the existing files do not look like a coherent run, it may refuse to continue instead of guessing what should be overwritten.
+The script is conservative. If existing files do not look like a coherent run, it may refuse to continue instead of guessing what should be overwritten.
 
 ---
 
@@ -405,7 +424,7 @@ It does **not** create persistent `.bak` duplicate files.
 
 Temporary drive or storage loss is treated as something to wait through. If the storage root stays unavailable beyond the retry window, the script requests a graceful stop where possible.
 
-The retry timing can be controlled with environment variables:
+Retry timing can be controlled with environment variables:
 
 ```bat
 set BD_IO_RETRY_SECONDS=1800
@@ -425,37 +444,9 @@ io_retry_max_delay = 5.0
 
 ---
 
-## Useful commands
-
-Run with a specific thread grouping:
-
-```bash
-python battledance_training.py --threads-mode 5
-```
-
-Override prelude worker count for a fresh or resumable prelude:
-
-```bash
-python battledance_training.py --prelude-workers 5
-```
-
-Override prelude rounds:
-
-```bash
-python battledance_training.py --prelude-rounds 8
-```
-
-Syntax-check the main script:
-
-```bash
-python -S -m py_compile battledance_training.py
-```
-
----
-
 ## What to change carefully
 
-`training_config.ini` exposes many knobs. Most are safe to experiment with only before a fresh run.
+`training_config.ini` exposes many knobs. Most structural settings are safest to change only before a fresh run.
 
 Usually safe between resumes:
 
@@ -481,17 +472,31 @@ Changing structural settings mid-run can make existing snapshots or progress fil
 
 ---
 
+## What this project is not
+
+This repository is not a polished game client, not a finished AI product, and not a library with a stable public API.
+
+It is mainly:
+
+```text
+a rules engine for Battledance Chess
+a long-running self-play experiment
+a resumable neuroevolution training script
+```
+
+---
+
 ## License
 
 Copyright (C) 2025 Jacob Scow
 
 This project is licensed under the GNU General Public License v3.0 or later.
 
-See `LICENSE.txt` for the full license text.
+See `LICENSE` for the full license text.
 
 ---
 ## Disclaimer
 
 This was purely vibe-coded, right down to even all sections above this one in this README.md being AI-written. I, Jacob Scow, just kept reiterating (parts of) the specs to the AI until it; actually gave me something that does the thing. Hopefully. I better hope so, because: Responsibility for the design, behavior, bugs, and licensing of this repository rests with me, not the AI.
 
-Stability: Experimental. This is a “works on my machine, generated with AI (+ human prodding)” project. Expect bugs, weird edge cases, and rough edges. Even though I don't seem to experience any myself when running it on my machine.
+Stability: Experimental. This is a "works on my machine, generated with AI (+ human prodding)" project. Expect bugs, weird edge cases, and rough edges. Even though I don't seem to experience any myself when running it on my machine.
