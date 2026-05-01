@@ -1,323 +1,77 @@
 # Battledance Chess MLP-GA Trainer
 
-Battledance Chess MLP-GA Trainer is a self-play training framework for **Battledance Chess**, a custom chesslike game with unusual leaper pieces, drops, royal bishops, and stalemate-as-loss.
+This repository trains simple neural-network players for **Battledance Chess**, a custom chesslike board game. The trainer does not use human game records or hand-written chess strategy. Instead, it creates many neural networks, lets them play the game, keeps the ones that perform best, mutates and recombines them, and repeats that process over many cycles.
 
-The program implements:
+The project has two main parts:
 
-- the Battledance Chess rules engine;
-- a 3-hidden-layer tanh MLP board evaluator;
-- a population-based genetic algorithm for evolving agents;
-- per-agent snapshot history;
-- resumable multi-process training;
-- prelude seed ranking for stronger first-run initialization.
+1. **Battledance Chess** — the actual game being played.
+2. **The MLP-GA trainer** — the neuroevolution system that tries to improve computer players for that game.
 
-Yes, it is compute-heavy. No, it is not optimized. You have been warned.
+“MLP-GA” means:
 
----
+- **MLP**: a multi-layer perceptron, which is a basic feed-forward neural network.
+- **GA**: a genetic algorithm, meaning candidate networks are selected, crossed over, mutated, and tested again.
 
-## Features
-
-### Battledance Chess rules engine
-
-The code implements the full game engine used for training:
-
-- 8×8 board.
-- Custom pieces:
-  - `K` — Kirin
-  - `N` — kNight
-  - `F` — Frog
-  - `L` — Lancer
-  - `P` — Phoenix
-  - `G` — roGue
-  - `R` — Rook
-  - `B` — Bishop
-- The royal pieces are bishops.
-- Capturing a royal bishop wins.
-- No legal moves means the side to move loses.
-- Captured non-bishop pieces go into hand and may later be dropped onto that player’s home rows.
-- Draw conditions:
-  - threefold repetition;
-  - 64-move rule, implemented as 128 plies since the last capture or drop;
-  - hard long-game cap at 4096 plies.
-
-The canonical starting position is encoded internally as:
-
-```text
-rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
-```
+This is experimental research/toy-code. It is intended to run for a long time, save progress frequently, and survive ordinary interruptions such as graceful stops, crashes, and temporary storage/drive blinks.
 
 ---
 
-## Neural network evaluator
+## Quick start
 
-Each agent uses a feed-forward MLP to evaluate board positions.
+Install dependencies:
 
-Architecture:
-
-```text
-Input:  594 features
-Hidden: 512 tanh
-Hidden: 512 tanh
-Hidden: 512 tanh
-Output: 1 tanh scalar
+```bash
+pip install -r requirements.txt
 ```
 
-The output is White-centric:
-
-```text
-+1 ≈ good for White
--1 ≈ good for Black
-```
-
-Position encoding includes:
-
-- board occupancy and piece planes;
-- pieces in hand;
-- side to move;
-- repetition count;
-- 64-move counter;
-- total game length.
-
-Move choice is one-ply:
-
-1. Generate all legal moves.
-2. Apply each move temporarily.
-3. Evaluate the resulting position.
-4. Choose probabilistically among high-scoring moves.
-
-This is not a search engine. It is a learned evaluator used greedily with weighted randomness.
-
----
-
-## Training method
-
-Training uses a population-based genetic algorithm rather than backpropagation.
-
-Each trainable agent has a population of:
-
-```text
-260 networks
-```
-
-formed from:
-
-```text
-256 crossover/mutation children
-4 elite direct clones
-```
-
-A generation is evaluated in two stages:
-
-1. **Stage 1**: cheap evaluation of all 260 networks against the relevant frozen opponent snapshots.
-2. **Stage 2**: heavier evaluation of the top candidates from Stage 1.
-
-The top 8 successful candidates become the next parent set.
-
-A generation only succeeds if the selected parents achieve non-negative margins against every required opponent snapshot at full Stage-2 resolution.
-
-There is no default hard generation cap. A difficult agent can keep evolving until it passes the success gate.
-
----
-
-## Agents
-
-There are 15 named agents:
-
-```text
-Red Grn Blu Cyn Mag Yel NoN deR nrG ulB nyC gaM leY XyZ ZyX
-```
-
-Most element agents train against:
-
-```text
-6 matrix-selected element opponents + ZyX + self
-```
-
-`XyZ` trains broadly against:
-
-```text
-all 13 normal element labels + XyZ
-```
-
-`ZyX` trains narrowly against:
-
-```text
-XyZ + ZyX
-```
-
-This means agents do not all train against the same opponent set.
-
----
-
-## Snapshot files
-
-Each agent uses five snapshot slots:
-
-```text
-Name_0.pkl
-Name_1.pkl
-Name_2.pkl
-Name_3.pkl
-Name_4.pkl
-```
-
-Meanings:
-
-```text
-_0 = current trainable parent population / active cycle parents
-_1 = newest completed parent set
-_2 = previous champion
-_3 = older champion
-_4 = oldest retained champion
-```
-
-After a full cycle completes, snapshots rotate:
-
-```text
-_0 → _1
-old _1 champion → _2
-old _2 champion → _3
-old _3 champion → _4
-```
-
-The newest `_1` file is a parent-list file, not just one champion. When a single champion is needed, the first parent in the list is used.
-
----
-
-## Prelude initialization
-
-On a fresh or empty `models` directory, plain execution defaults to prelude initialization:
+Run the trainer:
 
 ```bash
 python battledance_training.py
 ```
 
-The prelude creates 60 distinct Xavier-initialized seed networks and ranks them with a round-robin tournament.
-
-Default prelude workload:
+Request a graceful stop while it is running:
 
 ```text
-8 * 60^2 = 28,800 games
+q
 ```
 
-For distinct unordered seed pairs, this gives:
+On some terminals you may need to type `q` and press Enter. The program finishes the current game, saves what it safely can, and exits without rotating snapshots or advancing the cycle early.
 
-```text
-16 games per pair
-```
-
-Self-intersection games cancel cleanly in scoring.
-
-After ranking, the 60 seed networks are snake-assigned across the 15 labels and four retained snapshot slots using the built-in prelude order:
-
-```text
-ZyX XyZ deR nyC Red Cyn nrG gaM Grn Mag ulB leY Blu Yel NoN
-```
-
-The assignment shape is:
-
-```text
-_1: ranks  1..15
-_2: ranks 30..16
-_3: ranks 31..45
-_4: ranks 60..46
-```
-
-Each label receives the same total rank budget.
-
-To skip the prelude and use the older direct Xavier initialization:
-
-```bash
-python battledance_training.py --no-prelude-init
-```
-
-Prelude options:
-
-```bash
-python battledance_training.py --prelude-rounds 8
-python battledance_training.py --prelude-workers 5
-python battledance_training.py --prelude-seed 12345
-```
-
-If a prelude is interrupted before `training_state.json` exists, rerunning the script resumes the prelude from saved progress.
-
----
-
-## Running training
-
-Basic command:
+To resume, run the same base command again:
 
 ```bash
 python battledance_training.py
 ```
 
-Default process mode:
+---
+
+## Files in the repo
 
 ```text
---threads-mode 5
+battledance_training.py   Main game engine and training program.
+training_config.ini       Human-editable control knobs for fresh runs.
+README.md                 This explanation.
+LICENSE.txt               GPL-3.0-or-later license text.
+requirements.txt          Python dependency list.
+.gitignore                Suggested ignored runtime outputs.
 ```
 
-Accepted process modes:
-
-```bash
-python battledance_training.py --threads-mode 1
-python battledance_training.py --threads-mode 3
-python battledance_training.py --threads-mode 5
-```
-
-Meaning:
+The program creates runtime directories beside the script:
 
 ```text
-1 = single process
-3 = three worker processes
-5 = five worker processes
+models/        Model snapshots, rotation plans, training state, and training log.
+ga_progress/   Frequently updated JSON progress files.
+sample_games/  Human-readable game logs and cycle-end result matrices.
 ```
 
-Press `q` while running to request a graceful stop. The program finishes the current game, checkpoints progress, and exits at a safe point.
-
-Ctrl+C once also requests a graceful stop. Ctrl+C again forces interruption.
+These generated directories can become large and should normally **not** be committed.
 
 ---
 
-## Resumability
+## Important fresh-run rule
 
-The trainer is designed for aggressive resumability.
-
-Most long-running game passes checkpoint after every game, so a crash or graceful stop usually loses at most the current in-progress game.
-
-Important durable state includes:
-
-```text
-models/training_state.json
-models/cycle_progress.json
-models/ga_done_<Name>.json
-models/prelude_progress.json
-models/prelude_ranking.json
-models/prelude_assignment.json
-models/cycle_<n>_rotation_done.json
-models/cycle_<n>_rotation_summary.json
-models/cycle_<n>_champions_rr_done.json
-```
-
-High-churn per-game progress markers are kept outside `models`:
-
-```text
-ga_progress/
-```
-
-Sample games and matrices are also kept outside `models`:
-
-```text
-sample_games/
-```
-
-This keeps `models` easier to browse while training is active.
-
----
-
-## Output directories
-
-The script creates these directories beside `battledance_training.py`:
+For a clean canonical run, start with these generated directories absent or empty:
 
 ```text
 models/
@@ -325,152 +79,436 @@ ga_progress/
 sample_games/
 ```
 
-### `models/`
+The script is intentionally conservative. If it sees stale generated state without a coherent canonical run state, it may refuse to start rather than guess what should be overwritten.
 
-Contains model snapshots and durable training state.
-
-Typical contents:
-
-```text
-Red_0.pkl
-Red_1.pkl
-Red_2.pkl
-Red_3.pkl
-Red_4.pkl
-...
-training_state.json
-cycle_progress.json
-prelude_progress.json
-prelude_ranking.json
-prelude_assignment.json
-cycle_<n>_rotation_done.json
-cycle_<n>_rotation_summary.json
-cycle_<n>_champions_rr_done.json
-training_log.txt
-```
-
-### `ga_progress/`
-
-Contains frequently updated per-game progress files.
-
-Typical contents:
-
-```text
-ga_progress_<Name>.json
-champion_progress_<Name>.json
-prelude_progress_worker_01.json
-prelude_progress_worker_02.json
-...
-cycle_<n>_champions_rr_progress_worker_01.json
-...
-```
-
-These files are intentionally separate from `models` because they update often during active training.
-
-### `sample_games/`
-
-Contains human-readable sample game logs and cycle-end champion round-robin outputs.
-
-Typical contents:
-
-```text
-champion_matches_<Name>.txt
-cycle_<n>_champions_rr_worker_01.txt
-cycle_<n>_champions_rr.txt
-cycle_<n>_matrix.txt
-```
-
-The cycle matrix files summarize directed results between the newly minted `_1` champions for a completed cycle.
+Once a run has started, do not manually edit, move, delete, or replace generated files while intending to resume that same run.
 
 ---
 
-## Cycle-end champion round-robin
+## Battledance Chess, in plain English
 
-After all agents complete a cycle and snapshots rotate, the script runs a champion round-robin between the newly minted `_1` champions.
+Battledance Chess is played on an 8×8 board. It looks chesslike, but the pieces and rules are custom.
 
-Default workload:
+Each side has pieces on the board. Captured non-royal pieces go into the capturing player’s hand and can later be **dropped** back onto that player’s home rows.
 
-```text
-4 * 15^2 = 900 games
-```
+The royal piece is the **Bishop**. Capturing an opposing Bishop wins the game.
 
-Outputs:
+A player also loses if they have no legal moves.
 
-```text
-sample_games/cycle_<n>_champions_rr.txt
-sample_games/cycle_<n>_matrix.txt
-```
+### Starting position
 
-The matrix is directed:
+The starting position is encoded internally as:
 
 ```text
-row = White champion
-column = Black champion
-cell = summed result from White's perspective
+rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
 ```
 
-With 4 reps, each cell is in:
+That means Black starts on the top two ranks and White starts on the bottom two ranks:
 
 ```text
-[-4, +4]
+8  r g l b b l g r
+7  p f n k k n f p
+6  . . . . . . . .
+5  . . . . . . . .
+4  . . . . . . . .
+3  . . . . . . . .
+2  P F N K K N F P
+1  R G L B B L G R
+   a b c d e f g h
 ```
+
+Uppercase pieces are White. Lowercase pieces are Black.
 
 ---
 
-## Verified snapshot rotation
+## Pieces and movement
 
-Snapshot rotation is treated as a safety-critical step.
+Most pieces are leapers. A leaper jumps directly to a target square if that square is on the board and is not occupied by a friendly piece. Leap directions are symmetric: for example, a `(2,1)` leap also covers the usual reflected and rotated versions.
 
-Before any cycle is marked rotated, the script:
+| Letter | Name | Movement idea |
+|---|---|---|
+| `K` | Kirin | Leaps like `(2,0)` and `(1,1)` |
+| `N` | kNight | Leaps like `(2,1)` |
+| `F` | Frog | Leaps like `(3,0)` and `(2,2)` |
+| `L` | Lancer | Leaps like `(3,1)` |
+| `P` | Phoenix | Leaps like `(1,0)` and `(3,3)` |
+| `G` | roGue | Leaps like `(3,2)` |
+| `R` | Rook | Slides orthogonally, chess-rook style |
+| `B` | Bishop | Slides diagonally, chess-bishop style; also royal |
 
-1. Builds per-agent full-payload rotation plans.
-2. Writes those plans to disk.
-3. Applies the planned snapshot rotation.
-4. Reloads and verifies the written destinations.
-5. Writes the rotation-done marker.
-6. Writes a best-effort rotation summary.
-7. Cleans up rotation plans best-effort.
-
-This prevents a mid-rotation interruption from accidentally double-rotating snapshots on resume.
-
-Rotation summary files are written to:
-
-```text
-models/cycle_<n>_rotation_summary.json
-```
-
-They include total and per-agent timing, verification status, and machine-readable snapshot transition metadata.
+A move that captures an opposing Bishop ends the game immediately.
 
 ---
 
-## Drive-blink tolerance
+## Drops
 
-The file I/O layer uses temp-file atomic replacement and retry logic.
+When a player captures a non-Bishop piece, that captured piece goes into their hand.
 
-Relevant environment variables:
+Later, instead of moving a board piece, the player may drop one held piece onto an empty square in their own home rows:
+
+- White home rows: ranks 1 and 2.
+- Black home rows: ranks 7 and 8.
+
+Drops reset the 64-move draw counter, just like captures do.
+
+---
+
+## Draws
+
+The game can draw by:
+
+- threefold repetition;
+- 128 plies without a capture or drop, equivalent to a 64-move rule;
+- a hard long-game cap at 4096 plies.
+
+A “ply” is one individual turn by one player.
+
+---
+
+## How the neural player thinks
+
+Each neural network evaluates a board position and returns one number between roughly `-1` and `+1`.
+
+The board is encoded as a 594-number feature vector containing:
+
+- piece locations;
+- pieces in hand;
+- side to move;
+- draw-counter and repetition information.
+
+The network is a tanh MLP. By default, its shape is:
 
 ```text
-BD_IO_RETRY_SECONDS
-BD_IO_RETRY_INITIAL_DELAY
-BD_IO_RETRY_MAX_DELAY
+594 -> 512 -> 512 -> 512 -> 1
 ```
+
+The input size `594` and output size `1` are fixed by the game encoding. The hidden layers are configurable in `training_config.ini`:
+
+```ini
+[network]
+hidden_layers = 512, 512, 512
+```
+
+For each legal move, the agent temporarily applies the move, evaluates the resulting position, and scores the move from the side-to-move’s perspective. Immediate wins receive a very large score. Terminal draws are treated as neutral.
+
+The agent does not always choose the single highest-scoring move. It filters for high-scoring candidate moves, then randomly chooses among them with weighting. This keeps games from becoming perfectly deterministic.
+
+---
+
+## What “neuroevolution” means here
+
+The trainer evolves populations of networks rather than using backpropagation.
+
+At a high level:
+
+1. Start with candidate neural networks.
+2. Make them play Battledance Chess.
+3. Score them by their game results.
+4. Keep the best networks as parents.
+5. Create children by crossover and mutation.
+6. Repeat until selected parents pass the success gate.
+7. Save snapshots and move to the next cycle.
+
+There is no explicit “correct move” answer key. Networks survive by performing well in games.
+
+---
+
+## Prelude initialization
+
+Fresh runs always begin with a **prelude** phase.
+
+The prelude creates a pool of fresh Xavier-initialized seed networks, has them play a round-robin, ranks them, and assigns the ranked seeds into each agent’s initial snapshot history using the configured snake order.
+
+The default prelude uses:
+
+```ini
+[prelude]
+rounds = 8
+workers = 5
+snake_order = ZyX, XyZ, deR, nyC, Red, Cyn, nrG, gaM, Grn, Mag, ulB, leY, Blu, Yel, NoN
+```
+
+The number of prelude seed networks is:
+
+```text
+number of agents × number of retained non-_0 snapshots
+```
+
+With the canonical defaults, that is:
+
+```text
+15 agents × 4 snapshots = 60 seed networks
+```
+
+There are no explicit seed command-line options. Fresh runs naturally diverge according to OS entropy, process timing, RNG calls, and surrounding runtime factors.
+
+---
+
+## Agents and snapshots
+
+The canonical config has 15 agents:
+
+```text
+Red, Grn, Blu, Cyn, Mag, Yel, NoN, deR, nrG, ulB, nyC, gaM, leY, XyZ, ZyX
+```
+
+Each agent has snapshot slots:
+
+```text
+Name_0.pkl   Current trainable parent population or active population checkpoint.
+Name_1.pkl   Most recent retained trained parents after rotation.
+Name_2.pkl   Older champion snapshot.
+Name_3.pkl   Older champion snapshot.
+Name_4.pkl   Older champion snapshot.
+```
+
+The `_0` slot is active during training. The non-`_0` slots are used as opponent history.
+
+After a cycle succeeds, snapshots rotate:
+
+```text
+_0 -> _1
+_1 -> _2
+_2 -> _3
+_3 -> _4
+```
+
+The rotation is plan-based and verified so an interruption during rotation can be resumed without double-rotating.
+
+---
+
+## One training cycle
+
+A cycle roughly works like this:
+
+1. Each agent trains against its configured opponent snapshots.
+2. Its population is evaluated in two stages.
+3. If selected parents pass the success gate, the agent is marked done for that cycle.
+4. The agent’s champion audit games are logged.
+5. Once all agents are done, snapshots rotate.
+6. The new `_1` champions play a cycle-end round-robin.
+7. The cycle counter advances.
+
+If a stop/crash happens before the cycle counter advances, rerunning the base command should resume or skip already verified completed work.
+
+---
+
+## Population and selection
+
+The canonical population settings are:
+
+```ini
+[population]
+parents = 8
+children_per_parent_intersection = 4
+elites = 4
+```
+
+The non-elite child count is:
+
+```text
+parents² × children_per_parent_intersection
+```
+
+With defaults:
+
+```text
+8² × 4 = 256 children
+```
+
+Then 4 elite parent clones are added:
+
+```text
+256 children + 4 elites = 260 networks
+```
+
+A generation is successful only if the chosen parents have non-negative margins against every required opponent snapshot at the configured evaluation depth.
+
+---
+
+## Stage 1 and Stage 2 evaluation
+
+The trainer uses a two-stage evaluation so it does not spend the full heavy game budget on every single candidate.
 
 Defaults:
 
-```text
-BD_IO_RETRY_SECONDS=300
-BD_IO_RETRY_INITIAL_DELAY=0.5
-BD_IO_RETRY_MAX_DELAY=5.0
+```ini
+[evaluation]
+stage1_rounds = 2
+stage2_finalists = 12
+stage2_rounds = 16
+worst_only_every_unsuccessful_generations = 1024
 ```
 
-Example for a flaky external drive:
+Plain-English version:
+
+- **Stage 1** gives every candidate a cheaper first evaluation.
+- The best candidates become **Stage 2 finalists**.
+- **Stage 2** spends more games on the finalists.
+- The best finalists become the next parent set.
+
+If `stage2_finalists` is less than or equal to the parent count, Stage 2 is skipped and Stage 1 directly chooses parents.
+
+---
+
+## Mutation and crossover
+
+Children are created by uniform crossover between parent networks. Then mutation adds random noise to a fraction of weights and biases.
+
+Defaults:
+
+```ini
+[mutation]
+rate_schedule = 0:0.00390625
+weight_decay_schedule = 0:0.0
+weight_noise_scale_multiplier = 0.5
+bias_noise_scale = 0.05
+```
+
+`0.00390625` is `1/256`.
+
+Schedules use `cycle:value` pairs. For example:
+
+```ini
+rate_schedule = 0:0.015625, 2:0.00390625, 10:0.001953125
+```
+
+would mean:
+
+```text
+cycle 0+  -> 1/64
+cycle 2+  -> 1/256
+cycle 10+ -> 1/512
+```
+
+---
+
+## Opponents
+
+Opponent lists are configured per agent:
+
+```ini
+[opponents]
+default = all
+Red = NoN, Grn, ulB, Cyn, gaM, Yel, ZyX, Red
+```
+
+If an agent is omitted from `[opponents]`, it trains against `all`, meaning all configured agents including itself.
+
+Special values:
+
+```text
+all        All configured agents, including self.
+all_other  All configured agents except self.
+self       Only this agent’s own past snapshots.
+```
+
+---
+
+## Thread modes
+
+`--threads-mode` is a string. It may name an explicit grouping in `training_config.ini`, or it may be a numeric string that auto-splits the agent list.
+
+The default config includes:
+
+```ini
+[threads]
+default = 5
+1 = ZyX, nyC, deR, Cyn, Red, XyZ, gaM, nrG, Mag, Grn, leY, ulB, NoN, Yel, Blu
+3 = deR, Red, Mag, ulB, Blu | nyC, Cyn, gaM, leY, Yel | ZyX, XyZ, nrG, Grn, NoN
+5 = Red, Grn, Blu | Cyn, Mag, Yel | ZyX, XyZ, NoN | deR, nrG, ulB | nyC, gaM, leY
+```
+
+Run with an explicit mode:
 
 ```bash
+python battledance_training.py --threads-mode 5
+```
+
+If the default is omitted, the script falls back to one worker in the configured agent-name order.
+
+Each named mode must cover every configured agent exactly once.
+
+---
+
+## Config safety
+
+`training_config.ini` exposes many knobs, but not all knobs are safe to change mid-run.
+
+Safe or mostly safe to change between resumes:
+
+- I/O retry timing;
+- console/thread mode in many cases;
+- prelude worker count while only prelude worker progress is still coherent.
+
+Structural settings should only be changed before a fresh run:
+
+- agent names;
+- opponent lists;
+- snapshot counts;
+- hidden-layer architecture;
+- parent count;
+- children per intersection;
+- elite count;
+- evaluation rounds;
+- prelude snake order.
+
+Changing structural values mid-run can make existing snapshots or progress files incompatible. The script is designed to refuse unsafe assumptions rather than silently reinterpret old state.
+
+---
+
+## Resumability and storage robustness
+
+The trainer is designed around frequent checkpointing.
+
+It uses:
+
+- atomic replace-style writes for JSON, pickle, and text replacement files;
+- adjacent temporary files such as `*.tmp.<pid>` during writes;
+- retry loops for transient storage errors;
+- progress files that advance only after the relevant game result has been saved;
+- text-log reconciliation for champion audits and cycle round-robins;
+- verified snapshot saves for important parent/champion files;
+- idempotent rotation plans.
+
+It does **not** create persistent `.bak` duplicate files.
+
+Temporary storage loss is treated as something to wait through, not as an immediate reason to kill the run. If the storage root stays unavailable beyond the retry window, the script requests a graceful stop where possible.
+
+Runtime I/O retry settings can be adjusted with environment variables or config defaults, depending on the current code path:
+
+```ini
+[runtime]
+io_retry_seconds = 300
+io_retry_initial_delay = 0.5
+io_retry_max_delay = 5.0
+```
+
+Environment examples on Windows Command Prompt:
+
+```bat
 set BD_IO_RETRY_SECONDS=1800
 python battledance_training.py
 ```
 
 That gives the script up to 30 minutes to wait for temporarily missing storage before giving up on an I/O operation.
+
+---
+
+## Cycle-end champion round-robin
+
+After a successful cycle and verified snapshot rotation, the new `_1` champions can play a cycle-end round-robin.
+
+Configured by:
+
+```ini
+[cycle_rr]
+reps = 4
+```
+
+Set `reps = 0` to skip this reporting pass.
+
+Outputs are written under `sample_games/`, including a move log and margin matrix.
 
 ---
 
@@ -488,13 +526,13 @@ Python packages:
 numpy
 ```
 
-Install dependencies:
+Install from `requirements.txt`:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-A syntax check can be run with:
+Syntax check:
 
 ```bash
 python -S -m py_compile battledance_training.py
@@ -504,9 +542,7 @@ python -S -m py_compile battledance_training.py
 
 ## Suggested `.gitignore`
 
-Generated training state and model files can become very large and should usually not be committed.
-
-Recommended:
+Recommended generated-output ignores:
 
 ```gitignore
 models/
@@ -525,12 +561,11 @@ Copyright (C) 2025 Jacob Scow
 
 This project is licensed under the GNU General Public License v3.0 or later.
 
-See `LICENSE` for the full license text.
+See `LICENSE.txt` for the full license text.
 
 ---
-
 ## Disclaimer
 
-This was purely vibe-coded, right down to even all sections above this one in this README.md being AI-written. I, Jacob Scow, just kept reiterating (parts of) the specs to the AI until it; actually gave me something that does the thing. Hopefully. I better hope so, because: Responsibility for the design, behavior, bugs, and licensing of this repository rests with me, not the AI.
+This was purely vibe-coded, right down to even the 4 sections above this one in this README.md being AI-written. I, Jacob Scow, just kept reiterating (parts of) the specs to the AI until it; actually gave me something that does the thing. Hopefully. I better hope so, because: Responsibility for the design, behavior, bugs, and licensing of this repository rests with me, not the AI.
 
 Stability: Experimental. This is a “works on my machine, generated with AI (+ human prodding)” project. Expect bugs, weird edge cases, and rough edges. Even though I don't seem to experience any myself when running it on my machine.

@@ -15,7 +15,7 @@ Battledance Chess training program.
 Implements a self-play training framework for the Battledance Chess variant:
 - Full rules engine (custom leap/slide pieces, drops, threefold, 64-move, long-game cap).
 - State encoding: 594-dim float feature vector.
-- Evaluator: 3-hidden-layer tanh MLP (512 wide), scalar output.
+- Evaluator: configurable hidden-layer tanh MLP, scalar output.
 - Population-based neuroevolution (260 nets), selection/crossover/mutation.
 - Snapshot semantics: five slots per agent (_0.._4), active parents plus four retained opponent snapshots.
 - Per-cycle resumability via progress JSONs; per-agent champion evaluation logs.
@@ -31,6 +31,7 @@ import random
 import hashlib
 import time
 import argparse
+import configparser
 import multiprocessing
 import threading
 import queue
@@ -58,6 +59,22 @@ PRELUDE_SNAKE_ORDER: List[str] = [
 
 DEFAULT_PRELUDE_ROUNDS = 8  # 8 * 60^2 scheduled games = 16 games per distinct unordered seed pair
 DEFAULT_PRELUDE_WORKERS = 5  # split the 60 white-seed rows into 5 workloads of 12 by default
+
+TRAINING_SNAPSHOT_INDICES: Tuple[int, ...] = SNAPSHOT_INDICES
+PARENT_COUNT: int = 8
+CHILDREN_PER_PARENT_INTERSECTION: int = 4
+ELITE_COUNT: int = 4
+STAGE1_ROUNDS: int = 2
+STAGE2_FINALISTS: int = 12
+STAGE2_ROUNDS: int = 16
+WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS: int = 1024
+MUTATION_RATE_SCHEDULE: List[Tuple[int, float]] = [(0, 1.0 / 256.0)]
+WEIGHT_DECAY_SCHEDULE: List[Tuple[int, float]] = [(0, 0.0)]
+MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER: float = 0.5
+MUTATION_BIAS_NOISE_SCALE: float = 0.05
+MOVE_CHOICE_THRESHOLD: float = 0.8
+TERMINAL_WIN_SCORE: float = 1_000_000.0
+HIDDEN_LAYER_SIZES: Tuple[int, ...] = (512, 512, 512)
 ###############################################################################
 #  Graceful stop (main-process keypress + cross-process stop event)
 ###############################################################################
@@ -65,6 +82,13 @@ DEFAULT_PRELUDE_WORKERS = 5  # split the 60 white-seed rows into 5 workloads of 
 class GracefulStop(Exception):
     """Raised to request a clean stop at the next safe checkpoint."""
     pass
+
+
+# Set when a storage root stays missing past the configured retry window.
+# If this is true, check_stop() should not attempt another final durable
+# checkpoint, because that would usually just wait through the same retry
+# window again before exiting.
+_PERSISTENT_STORAGE_LOSS_DETECTED: bool = False
 
 
 def check_stop(stop_event, *, ga_progress: Optional[Dict] = None) -> None:
@@ -83,86 +107,184 @@ def check_stop(stop_event, *, ga_progress: Optional[Dict] = None) -> None:
     if not is_set:
         return
 
-    # Best-effort: force a durable GA progress checkpoint on stop.
-    if ga_progress is not None:
+    # Best-effort: force a durable GA progress checkpoint on ordinary stop.
+    # If the stop was caused by persistent storage loss, avoid waiting through
+    # the same failed retry window a second time.
+    if ga_progress is not None and not _PERSISTENT_STORAGE_LOSS_DETECTED:
         try:
-            path = _ga_progress_path()
-            if path:
-                _safe_write_json(path, ga_progress, indent=2, durable=True)
+            save_ga_progress(ga_progress, durable=True)
         except Exception:
             pass
 
     raise GracefulStop()
 
 
+# One process-wide keyboard listener.  Several phases call start_stop_listener()
+# (prelude, training, post-cycle RR).  Older versions started one daemon thread
+# per phase, so a stale thread could consume 'q' meant for a newer phase.  This
+# registry keeps a single listener alive and retargets it to the currently active
+# stop event.
+_STOP_LISTENER_LOCK = threading.Lock()
+_STOP_LISTENER_THREAD: Optional[threading.Thread] = None
+_STOP_LISTENER_EVENT: Optional[object] = None
+_STOP_LISTENER_LOGGED: bool = False
+_SIGINT_INSTALLED: bool = False
+_SIGINT_STOP_EVENT: Optional[object] = None
+_ORIGINAL_SIGINT_HANDLER: Optional[object] = None
+
+
+def _get_active_stop_event():
+    with _STOP_LISTENER_LOCK:
+        return _STOP_LISTENER_EVENT
+
+
+def _set_active_stop_event(stop_event) -> None:
+    global _STOP_LISTENER_EVENT, _SIGINT_STOP_EVENT
+    with _STOP_LISTENER_LOCK:
+        _STOP_LISTENER_EVENT = stop_event
+        _SIGINT_STOP_EVENT = stop_event
+
+
+def _request_active_graceful_stop(reason: str) -> None:
+    """Set the current global stop event, if any, without depending on log I/O."""
+    active = _get_active_stop_event()
+    if active is None:
+        return
+    try:
+        if not active.is_set():
+            active.set()
+            try:
+                sys.stderr.write(f"\n[global] Graceful stop requested: {reason}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
+def _seed_process_move_randomness(label: str = "") -> int:
+    """Seed Python's global random module once per worker process.
+
+    Neural-net mutation/crossover still uses explicit NumPy RandomState objects.
+    This only decorrelates stochastic move choice when processes are forked.
+    """
+    try:
+        seed = int.from_bytes(os.urandom(16), "big")
+    except Exception:
+        seed = (time.time_ns() ^ (os.getpid() << 32) ^ hash(label)) & ((1 << 128) - 1)
+    random.seed(seed)
+    return int(seed)
+
+
 def start_stop_listener(stop_event) -> threading.Thread:
     """
-    Start a daemon thread in the main process that listens for a keypress to
-    request a graceful stop. On Windows it listens for 'q' without Enter using
-    msvcrt; otherwise it falls back to reading a line ('q' + Enter).
+    Register the active graceful-stop event and ensure exactly one keyboard
+    listener thread exists in this process.
+
+    Repeated calls retarget the listener to the newest phase's stop_event rather
+    than creating stale competing listeners.
     """
+    global _STOP_LISTENER_THREAD, _STOP_LISTENER_LOGGED
+
+    _set_active_stop_event(stop_event)
+
+    if _STOP_LISTENER_THREAD is not None and _STOP_LISTENER_THREAD.is_alive():
+        return _STOP_LISTENER_THREAD
+
+    def _request_stop(source: str) -> None:
+        active = _get_active_stop_event()
+        if active is None:
+            return
+        try:
+            if not active.is_set():
+                active.set()
+                log(f"[global] Graceful stop requested ({source}).")
+        except Exception:
+            return
+
     def _thread() -> None:
+        global _STOP_LISTENER_LOGGED
         # Prefer Windows non-blocking keypress (no Enter).
         try:
             import msvcrt  # type: ignore
-            log("[global] Press 'q' to request graceful stop (finish current game, save, exit).")
-            while not stop_event.is_set():
+            if not _STOP_LISTENER_LOGGED:
+                log("[global] Press 'q' to request graceful stop (finish current game, save, exit).")
+                _STOP_LISTENER_LOGGED = True
+            while True:
                 if msvcrt.kbhit():
                     ch = msvcrt.getwch()
                     if ch and ch.lower() == "q":
-                        stop_event.set()
-                        log("[global] Graceful stop requested (q).")
-                        return
+                        _request_stop("q")
                 time.sleep(0.1)
-            return
         except Exception:
             pass
 
         # Portable fallback: requires Enter.
         try:
-            log("[global] Type 'q' + Enter to request graceful stop (finish current game, save, exit).")
-            while not stop_event.is_set():
+            if not _STOP_LISTENER_LOGGED:
+                log("[global] Type 'q' + Enter to request graceful stop (finish current game, save, exit).")
+                _STOP_LISTENER_LOGGED = True
+            while True:
                 line = sys.stdin.readline()
                 if not line:
                     return
                 if line.strip().lower() in ("q", "quit", "stop"):
-                    stop_event.set()
-                    log("[global] Graceful stop requested (stdin).")
-                    return
+                    _request_stop("stdin")
         except Exception:
             return
 
-    t = threading.Thread(target=_thread, daemon=True)
-    t.start()
-    return t
+    _STOP_LISTENER_THREAD = threading.Thread(target=_thread, daemon=True)
+    _STOP_LISTENER_THREAD.start()
+    return _STOP_LISTENER_THREAD
 
 
 def install_sigint_as_graceful(stop_event) -> None:
     """
     Convert the first Ctrl+C into a graceful stop request; a second Ctrl+C
-    triggers the normal KeyboardInterrupt.
+    triggers the original handler / KeyboardInterrupt.
+
+    Like start_stop_listener(), this installs only once and retargets later
+    calls to the newest phase's stop_event.
     """
+    global _SIGINT_INSTALLED, _SIGINT_STOP_EVENT, _ORIGINAL_SIGINT_HANDLER
+
+    _set_active_stop_event(stop_event)
+
     try:
         import signal
     except Exception:
         return
 
+    if _SIGINT_INSTALLED:
+        return
+
     try:
-        old_handler = signal.getsignal(signal.SIGINT)
+        _ORIGINAL_SIGINT_HANDLER = signal.getsignal(signal.SIGINT)
     except Exception:
-        old_handler = None
+        _ORIGINAL_SIGINT_HANDLER = None
 
     def _handler(sig, frame):
-        if not stop_event.is_set():
-            stop_event.set()
+        active = _SIGINT_STOP_EVENT
+        try:
+            already_set = bool(active is not None and active.is_set())
+        except Exception:
+            already_set = False
+
+        if active is not None and not already_set:
+            try:
+                active.set()
+            except Exception:
+                pass
             log("[global] Ctrl+C received -> graceful stop requested. Press Ctrl+C again to force.")
-        else:
-            if callable(old_handler):
-                old_handler(sig, frame)
-            raise KeyboardInterrupt
+            return
+
+        if callable(_ORIGINAL_SIGINT_HANDLER):
+            _ORIGINAL_SIGINT_HANDLER(sig, frame)
+        raise KeyboardInterrupt
 
     try:
         signal.signal(signal.SIGINT, _handler)
+        _SIGINT_INSTALLED = True
     except Exception:
         return
 
@@ -186,8 +308,11 @@ def setup_logging(base_dir: str, cycle: int) -> None:
             os.makedirs(base_dir, exist_ok=True)
             LOG_PATH = os.path.join(base_dir, "training_log.txt")
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(f"\n=== New session cycle={cycle} started {ts} ===\n")
+            _append_text_with_retry(
+                LOG_PATH,
+                f"\n=== New session cycle={cycle} started {ts} ===\n",
+                durable=False,
+            )
         except Exception:
             LOG_PATH = None
             # swallow: logging must never crash training
@@ -218,8 +343,7 @@ def log(msg: str, also_print: bool = True) -> None:
 
     if LOG_PATH is not None:
         try:
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            _append_text_with_retry(LOG_PATH, line + "\n", durable=False)
         except Exception:
             pass
 
@@ -296,6 +420,59 @@ def status(msg: str) -> None:
     sys.stdout.flush()
     _last_status_len = len(line)
 
+
+def _collect_worker_results_or_raise(
+    *,
+    processes: Sequence[multiprocessing.Process],
+    result_queue: object,
+    expected_count: int,
+    context: str,
+) -> List[Dict[str, object]]:
+    """
+    Collect one result message per worker without hanging forever if a worker
+    dies before it can post to the result queue.
+    """
+    results: List[Dict[str, object]] = []
+
+    while len(results) < int(expected_count):
+        try:
+            item = result_queue.get(timeout=0.5)  # type: ignore[attr-defined]
+            if isinstance(item, dict):
+                results.append(item)
+            else:
+                results.append({"error": f"non-dict worker result: {item!r}"})
+            continue
+        except queue.Empty:
+            pass
+        except Exception as e:
+            alive = [p for p in processes if p.is_alive()]
+            if not alive:
+                states = ", ".join(f"{p.name}:exit={p.exitcode}" for p in processes)
+                raise RuntimeError(
+                    f"{context}: result queue failed before all workers reported "
+                    f"({len(results)}/{expected_count}); process states: {states}; queue error: {e!r}"
+                ) from e
+            continue
+
+        alive = [p for p in processes if p.is_alive()]
+        bad = [p for p in processes if p.exitcode not in (None, 0)]
+
+        if bad:
+            states = ", ".join(f"{p.name}:exit={p.exitcode}" for p in processes)
+            raise RuntimeError(
+                f"{context}: worker process ended before posting all result messages "
+                f"({len(results)}/{expected_count}); process states: {states}"
+            )
+
+        if not alive:
+            states = ", ".join(f"{p.name}:exit={p.exitcode}" for p in processes)
+            raise RuntimeError(
+                f"{context}: all workers exited but only {len(results)}/{expected_count} "
+                f"result messages were received; process states: {states}"
+            )
+
+    return results
+
 ###############################################################################
 #  Cycle progress tracking (for resumability)
 ###############################################################################
@@ -324,14 +501,12 @@ def load_cycle_progress(
     return {"cycle": cycle, "agents": agents_progress}
 
 def save_cycle_progress(base_dir: str, progress: Dict) -> None:
-    """
-    Persist the current per-cycle, per-agent progress state atomically.
-    """
+    """Persist the current per-cycle, per-agent progress state atomically."""
     path = os.path.join(base_dir, "cycle_progress.json")
     try:
         _safe_write_json(path, progress, indent=2, durable=True)
-    except Exception:
-        pass
+    except Exception as e:
+        _raise_checkpoint_write_failure("write cycle progress", path, e)
 
 def load_champion_progress(base_dir: str, cycle: int, name: str) -> Dict:
     data = _read_progress_marker_json(base_dir, f"champion_progress_{name}.json")
@@ -345,10 +520,11 @@ def load_champion_progress(base_dir: str, cycle: int, name: str) -> Dict:
     return data
 
 def save_champion_progress(base_dir: str, name: str, progress: Dict) -> None:
+    path = _progress_marker_path(base_dir, f"champion_progress_{name}.json")
     try:
         _write_progress_marker_json(base_dir, f"champion_progress_{name}.json", progress, indent=2, durable=True)
-    except Exception:
-        pass
+    except Exception as e:
+        _raise_checkpoint_write_failure("write champion progress", path, e)
 
 ###############################################################################
 #  GA generation progress tracking (for resumability)
@@ -379,16 +555,238 @@ def load_ga_progress() -> Optional[Dict]:
     if GA_BASE_DIR is None or filename is None:
         return None
     data = _read_progress_marker_json(GA_BASE_DIR, filename)
-    return data if isinstance(data, dict) else None
+    if isinstance(data, dict):
+        _seed_ga_progress_timing_runtime(data)
+        return data
+    return None
 
-def save_ga_progress(progress: Dict) -> None:
+
+# Per-process timing state for GA ETA metadata.  This intentionally lives
+# outside the JSON file so resumed runs do not count downtime between the
+# previous checkpoint and the first new game completed after resume.
+_GA_PROGRESS_TIMING_RUNTIME: Dict[Tuple[int, str, int, str], Dict[str, object]] = {}
+
+
+def _timestamp_now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _timestamp_from_epoch(epoch_seconds: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(epoch_seconds)))
+
+
+def _format_eta_duration(seconds: object) -> str:
+    """Compact human-readable ETA duration, e.g. 2d03h, 04h12m, 09m30s."""
+    try:
+        total = int(max(0.0, float(seconds)))
+    except Exception:
+        return "--"
+
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    if days > 0:
+        return f"{days}d{hours:02d}h"
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _ga_eta_status_suffix(progress: Optional[Dict], stage_name: str) -> str:
+    """Return a short console-only ETA suffix for the active GA stage."""
+    if not isinstance(progress, dict):
+        return " | ETA --"
+
+    section = progress.get(stage_name)
+    if not isinstance(section, dict):
+        return " | ETA --"
+
+    finish = section.get("eta_stage_finish")
+    remaining = section.get("eta_seconds_remaining")
+    if finish is None or remaining is None:
+        return " | ETA --"
+
+    try:
+        remaining_f = float(remaining)
+    except Exception:
+        return " | ETA --"
+
+    return f" | ETA {_format_eta_duration(remaining_f)} ({finish})"
+
+def _ga_progress_active_stage_name(progress: Dict) -> Optional[str]:
+    stage = str(progress.get("stage", "stage1"))
+    if stage in ("stage2", "done") and isinstance(progress.get("stage2"), dict):
+        return "stage2"
+    if stage in ("stage1", "stage1_complete") and isinstance(progress.get("stage1"), dict):
+        return "stage1"
+    if isinstance(progress.get("stage2"), dict):
+        return "stage2"
+    if isinstance(progress.get("stage1"), dict):
+        return "stage1"
+    return None
+
+
+def _ga_progress_stage_total_games(progress: Dict, stage_name: str) -> int:
+    try:
+        m = int(progress.get("n_opponents", 0) or 0)
+        n1 = int(progress.get("n1", 0) or 0)
+        n2 = int(progress.get("n2", 0) or 0)
+        if stage_name == "stage1":
+            n = int(progress.get("n_candidates", 0) or 0)
+            return max(0, n * m * 2 * n1)
+        if stage_name == "stage2":
+            s2 = progress.get("stage2") or {}
+            top_indices = s2.get("top_indices", []) if isinstance(s2, dict) else []
+            top_count = len(top_indices) if isinstance(top_indices, list) else 0
+            additional = max(0, n2 - n1)
+            return max(0, top_count * m * 2 * additional)
+    except Exception:
+        return 0
+    return 0
+
+
+def _ga_progress_runtime_key(progress: Dict, stage_name: str) -> Tuple[int, str, int, str]:
+    return (
+        int(progress.get("cycle", CURRENT_CYCLE) or 0),
+        str(progress.get("agent", CURRENT_AGENT_NAME) or ""),
+        int(progress.get("generation", CURRENT_GEN) or 0),
+        str(stage_name),
+    )
+
+
+def _seed_ga_progress_timing_runtime(progress: Dict) -> None:
+    """Seed the in-memory timing marker when an existing GA progress file is loaded."""
+    stage_name = _ga_progress_active_stage_name(progress)
+    if stage_name is None:
+        return
+    section = progress.get(stage_name)
+    if not isinstance(section, dict):
+        return
+    key = _ga_progress_runtime_key(progress, stage_name)
+    if key in _GA_PROGRESS_TIMING_RUNTIME:
+        return
+    try:
+        game_index = int(section.get("game_index", 0) or 0)
+    except Exception:
+        game_index = 0
+    _GA_PROGRESS_TIMING_RUNTIME[key] = {
+        "last_time": time.time(),
+        "last_game_index": game_index,
+    }
+
+
+def _refresh_ga_progress_timing(progress: Dict) -> None:
+    """
+    Add/update lightweight timing and ETA metadata in ga_progress_*.json.
+
+    ETA formula, per active stage:
+        now + (active_elapsed_seconds / games_played) * games_remaining
+
+    active_elapsed_seconds is accumulated only while the current process is
+    running and completing games, so ordinary resume downtime is not counted.
+    """
+    now = time.time()
+    now_s = _timestamp_from_epoch(now)
+    progress["timestamp_updated"] = now_s
+
+    stage_name = _ga_progress_active_stage_name(progress)
+    if stage_name is None:
+        return
+
+    section = progress.get(stage_name)
+    if not isinstance(section, dict):
+        return
+
+    try:
+        game_index = max(0, int(section.get("game_index", 0) or 0))
+    except Exception:
+        game_index = 0
+
+    total_games = _ga_progress_stage_total_games(progress, stage_name)
+    games_remaining = max(0, int(total_games) - int(game_index))
+
+    if "timestamp_started" not in section:
+        section["timestamp_started"] = now_s
+
+    try:
+        active_elapsed = max(0.0, float(section.get("active_elapsed_seconds", 0.0) or 0.0))
+    except Exception:
+        active_elapsed = 0.0
+
+    key = _ga_progress_runtime_key(progress, stage_name)
+    runtime = _GA_PROGRESS_TIMING_RUNTIME.get(key)
+    if runtime is None:
+        runtime = {"last_time": now, "last_game_index": game_index}
+        _GA_PROGRESS_TIMING_RUNTIME[key] = runtime
+    else:
+        try:
+            last_time = float(runtime.get("last_time", now) or now)
+            last_game_index = int(runtime.get("last_game_index", game_index) or 0)
+        except Exception:
+            last_time = now
+            last_game_index = game_index
+
+        # Only add elapsed time when at least one game has completed since
+        # the previous checkpoint in this process.  This avoids counting
+        # stopped/resumed downtime as active training time.
+        if game_index > last_game_index:
+            active_elapsed += max(0.0, now - last_time)
+
+        runtime["last_time"] = now
+        runtime["last_game_index"] = game_index
+
+    section["timestamp_updated"] = now_s
+    section["games_total"] = int(total_games)
+    section["games_played"] = int(game_index)
+    section["games_remaining"] = int(games_remaining)
+    section["active_elapsed_seconds"] = round(float(active_elapsed), 3)
+
+    if total_games > 0 and game_index >= total_games:
+        section["eta_seconds_remaining"] = 0.0
+        section["eta_stage_finish"] = now_s
+        if game_index > 0 and active_elapsed > 0.0:
+            seconds_per_game = active_elapsed / float(game_index)
+            section["seconds_per_game_active"] = round(seconds_per_game, 6)
+            section["games_per_hour_active"] = round(3600.0 / seconds_per_game, 3) if seconds_per_game > 0 else None
+    elif game_index > 0 and active_elapsed > 0.0:
+        seconds_per_game = active_elapsed / float(game_index)
+        eta_seconds = seconds_per_game * float(games_remaining)
+        section["seconds_per_game_active"] = round(seconds_per_game, 6)
+        section["games_per_hour_active"] = round(3600.0 / seconds_per_game, 3) if seconds_per_game > 0 else None
+        section["eta_seconds_remaining"] = round(eta_seconds, 3)
+        section["eta_stage_finish"] = _timestamp_from_epoch(now + eta_seconds)
+    else:
+        section["seconds_per_game_active"] = None
+        section["games_per_hour_active"] = None
+        section["eta_seconds_remaining"] = None
+        section["eta_stage_finish"] = None
+
+    progress[stage_name] = section
+
+    # Mirror the active-stage fields at top level for quick human inspection.
+    progress["eta_stage"] = stage_name
+    progress["games_total"] = section.get("games_total")
+    progress["games_played"] = section.get("games_played")
+    progress["games_remaining"] = section.get("games_remaining")
+    progress["active_elapsed_seconds"] = section.get("active_elapsed_seconds")
+    progress["games_per_hour_active"] = section.get("games_per_hour_active")
+    progress["eta_seconds_remaining"] = section.get("eta_seconds_remaining")
+    progress["eta_stage_finish"] = section.get("eta_stage_finish")
+
+
+def save_ga_progress(progress: Dict, *, durable: bool = False) -> None:
     filename = _ga_progress_filename()
     if GA_BASE_DIR is None or filename is None:
         return
+    path = _progress_marker_path(GA_BASE_DIR, filename)
     try:
-        _write_progress_marker_json(GA_BASE_DIR, filename, progress, indent=2, durable=False)
-    except Exception:
-        pass
+        _refresh_ga_progress_timing(progress)
+        _write_progress_marker_json(GA_BASE_DIR, filename, progress, indent=2, durable=durable)
+    except Exception as e:
+        _raise_checkpoint_write_failure("write GA progress", path, e)
 
 def reset_ga_progress() -> None:
     """
@@ -426,8 +824,8 @@ def save_ga_done_state(base_dir: str, name: str, cycle: int, last_gen: int) -> N
     }
     try:
         _safe_write_json(path, payload, indent=2, durable=True)
-    except Exception:
-        pass
+    except Exception as e:
+        _raise_checkpoint_write_failure("write GA done state", path, e)
 
 ###############################################################################
 #  Robust atomic file I/O
@@ -456,29 +854,13 @@ def _progress_marker_path(base_dir: str, filename: str) -> str:
     return os.path.join(_sidecar_dir("ga_progress"), filename)
 
 
-def _legacy_model_path(base_dir: str, filename: str) -> str:
-    """Old location used by prior versions, kept as a read-only migration fallback."""
-    return os.path.join(base_dir, filename)
-
 
 def _read_progress_marker_json(base_dir: str, filename: str) -> Optional[object]:
-    """
-    Read a progress marker from the script-adjacent ga_progress directory.
-
-    For resumability across versions, if the new sidecar file does not exist,
-    fall back to the old models\filename location. If the new file exists but
-    is corrupt, do not silently fall back to older data.
-    """
+    """Read a progress marker from the canonical ga_progress directory only."""
     path = _progress_marker_path(base_dir, filename)
     if _path_exists_respecting_transient_storage(path):
         return _safe_read_json(path)
-
-    legacy = _legacy_model_path(base_dir, filename)
-    if _path_exists_respecting_transient_storage(legacy):
-        return _safe_read_json(legacy)
-
     return None
-
 
 def _write_progress_marker_json(
     base_dir: str,
@@ -492,35 +874,17 @@ def _write_progress_marker_json(
 
 
 def _remove_progress_marker(base_dir: str, filename: str) -> None:
-    """Remove both current and legacy copies of a pure progress marker."""
-    for path in (_progress_marker_path(base_dir, filename), _legacy_model_path(base_dir, filename)):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-
+    """Remove the canonical copy of a pure progress marker."""
+    path = _progress_marker_path(base_dir, filename)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 def _sample_game_path(base_dir: str, filename: str) -> str:
     """Current location for sample game logs and cycle-end matrices."""
     return os.path.join(_sidecar_dir("sample_games"), filename)
-
-
-def _migrate_legacy_sample_game_if_needed(base_dir: str, filename: str) -> str:
-    """
-    Return the new sample-game path, copying an existing legacy models\filename
-    text file into sample_games\filename when the new file does not yet exist.
-    """
-    new_path = _sample_game_path(base_dir, filename)
-    old_path = _legacy_model_path(base_dir, filename)
-    try:
-        if (not os.path.exists(new_path)) and os.path.exists(old_path):
-            with open(old_path, "rb") as f:
-                payload = f.read()
-            _atomic_write_bytes(new_path, payload, durable=True)
-    except Exception:
-        pass
-    return new_path
 
 
 def _models_dir_empty_or_missing(base_dir: str) -> bool:
@@ -577,6 +941,53 @@ def _storage_root_missing(path: str) -> bool:
         return not os.path.exists(root)
     except OSError:
         return True
+
+
+def _request_stop_if_storage_root_still_missing(op: str, path: str, err: Optional[BaseException] = None) -> None:
+    """Request a graceful stop if an I/O operation gave up because the drive/share is still gone."""
+    global _PERSISTENT_STORAGE_LOSS_DETECTED
+    if not _storage_root_missing(path):
+        return
+    _PERSISTENT_STORAGE_LOSS_DETECTED = True
+    detail = f"persistent storage loss during {op} for {path!r}"
+    if err is not None:
+        detail += f" ({err!r})"
+    _request_active_graceful_stop(detail)
+
+def _raise_checkpoint_write_failure(op: str, path: str, err: BaseException) -> None:
+    """Handle a checkpoint write failure after the retry layer gives up.
+
+    Policy:
+      * transient write/append/replace errors are already retried inside the
+        low-level I/O helpers before this function is reached;
+      * if the drive/share is still missing, request a graceful stop rather
+        than treating it as a fatal programming error;
+      * if another checkpoint write failure persists past the retry window,
+        also request graceful stop when a stop event exists, so workers do not
+        continue playing games whose progress cannot be confirmed;
+      * only raise RuntimeError when there is no active graceful-stop channel.
+
+    This avoids silently advancing past an unconfirmed checkpoint while also
+    avoiding hard process failure over ordinary drive-blink style storage loss.
+    """
+    _request_stop_if_storage_root_still_missing(op, path, err)
+
+    if _PERSISTENT_STORAGE_LOSS_DETECTED:
+        raise GracefulStop()
+
+    detail = f"{op} failed after retries for {path!r} ({err!r})"
+    _request_active_graceful_stop(detail)
+
+    active = _get_active_stop_event()
+    try:
+        active_is_set = bool(active is not None and active.is_set())
+    except Exception:
+        active_is_set = False
+
+    if active_is_set:
+        raise GracefulStop()
+
+    raise RuntimeError(detail) from err
 
 
 def _warn_io_retry(op: str, path: str, err: BaseException, attempt: int, delay: float) -> None:
@@ -644,6 +1055,7 @@ def _atomic_write_bytes(path: str, payload: bytes, *, durable: bool = True) -> N
                 pass
 
             if time.time() >= deadline:
+                _request_stop_if_storage_root_still_missing("write", path, e)
                 raise
             _sleep_io_retry("write", path, e, attempt)
             attempt += 1
@@ -667,6 +1079,41 @@ def _safe_write_pickle(path: str, obj: object, *, durable: bool = True) -> None:
     _atomic_write_bytes(path, payload, durable=durable)
 
 
+def _safe_write_text(path: str, text: str, *, durable: bool = True) -> None:
+    """Atomically replace a UTF-8 text file, with the normal storage retry layer."""
+    _atomic_write_bytes(path, str(text).encode("utf-8"), durable=durable)
+
+
+def _append_text_with_retry(path: str, text: str, *, durable: bool = False) -> None:
+    """Append UTF-8 text with the same transient-storage retry policy as checkpoints.
+
+    Appends cannot be made atomic in the same way as temp-file replacement, but
+    this still prevents a brief drive/share blink from immediately killing a
+    long-running phase. Callers that use this for progress-coupled logs should
+    still advance progress only after this function returns successfully.
+    """
+    payload = str(text)
+    deadline = time.time() + max(0.0, IO_RETRY_SECONDS)
+    attempt = 0
+
+    while True:
+        try:
+            dirpath = os.path.dirname(path) or "."
+            os.makedirs(dirpath, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                if durable:
+                    os.fsync(f.fileno())
+            return
+        except OSError as e:
+            if time.time() >= deadline:
+                _request_stop_if_storage_root_still_missing("append", path, e)
+                raise
+            _sleep_io_retry("append", path, e, attempt)
+            attempt += 1
+
+
 def _path_exists_respecting_transient_storage(path: str) -> bool:
     """
     Like os.path.exists(), but waits if the whole drive/share is temporarily absent.
@@ -685,6 +1132,7 @@ def _path_exists_respecting_transient_storage(path: str) -> bool:
             err = e
 
         if time.time() >= deadline:
+            _request_stop_if_storage_root_still_missing("exists", path, err)
             return False
         _sleep_io_retry("exists", path, err, attempt)
         attempt += 1
@@ -706,6 +1154,7 @@ def _safe_read_json(path: str) -> Optional[object]:
             return None
         except OSError as e:
             if time.time() >= deadline:
+                _request_stop_if_storage_root_still_missing("read", path, e)
                 return None
             _sleep_io_retry("read", path, e, attempt)
             attempt += 1
@@ -729,6 +1178,7 @@ def _safe_read_pickle(path: str) -> Optional[object]:
             return None
         except OSError as e:
             if time.time() >= deadline:
+                _request_stop_if_storage_root_still_missing("read", path, e)
                 return None
             _sleep_io_retry("read", path, e, attempt)
             attempt += 1
@@ -881,8 +1331,8 @@ class BattledanceBoard:
                 kind = ch.upper()
                 self.board[r][c] = Piece(kind, color)
                 c += 1
-            if c > 8:
-                raise ValueError(f"Too many files in rank {r} of FEN {fen!r}")
+            if c != 8:
+                raise ValueError(f"Invalid Battledance FEN (rank {r} has {c} files, expected 8): {fen!r}")
 
         self.turn = "w" if side == "w" else "b"
         self.plys_since_capture_or_drop = 0
@@ -1641,108 +2091,237 @@ class BattledanceBoard:
 
 class MLP:
     """
-    Multi‑layer perceptron with three hidden layers and tanh activations.
+    Feed-forward tanh MLP board evaluator.
 
-    The network architecture is fixed: input_dim=594, hidden_dim=512,
-    output_dim=1.  Xavier/Glorot initialisation is used.  Mutation
-    applies Gaussian noise to a fraction of weights and biases.
+    Input and output dimensions are fixed by the game encoding:
+      * input: FEATURE_TOTAL = 594
+      * output: 1 tanh scalar
+
+    The hidden-layer architecture is configurable through training_config.ini:
+      [network]
+      hidden_layers = 512, 512, 512
+
+    Saved networks store their layer sizes with their parameter arrays. Loading is
+    strict: snapshots whose arrays do not match the current configured architecture
+    are refused rather than silently reshaped or partially accepted.
     """
 
-    def __init__(self, input_dim: int = 594, hidden_dim: int = 512, seed: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        input_dim: int = FEATURE_TOTAL,
+        hidden_layers: Optional[Sequence[int]] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.input_dim = int(input_dim)
+        self.hidden_layers = tuple(int(x) for x in (hidden_layers if hidden_layers is not None else HIDDEN_LAYER_SIZES))
+        if self.input_dim != FEATURE_TOTAL:
+            raise ValueError(f"MLP input_dim must be {FEATURE_TOTAL}; got {self.input_dim}.")
+        if not self.hidden_layers or any(int(x) <= 0 for x in self.hidden_layers):
+            raise ValueError("MLP hidden_layers must contain at least one positive integer width.")
+
         rnd = np.random.RandomState(seed)
-        def xavier(shape: Tuple[int, int]):
+
+        def xavier(shape: Tuple[int, int]) -> np.ndarray:
             fan_in, fan_out = shape
-            limit = np.sqrt(6.0 / (fan_in + fan_out))
+            limit = np.sqrt(6.0 / float(fan_in + fan_out))
             return rnd.uniform(-limit, limit, shape).astype(np.float32)
-        self.W1 = xavier((input_dim, hidden_dim))
-        self.b1 = np.zeros((hidden_dim,), dtype=np.float32)
-        self.W2 = xavier((hidden_dim, hidden_dim))
-        self.b2 = np.zeros((hidden_dim,), dtype=np.float32)
-        self.W3 = xavier((hidden_dim, hidden_dim))
-        self.b3 = np.zeros((hidden_dim,), dtype=np.float32)
-        self.W4 = xavier((hidden_dim, 1))
-        self.b4 = np.zeros((1,), dtype=np.float32)
+
+        dims = [self.input_dim] + list(self.hidden_layers) + [1]
+        self.weights: List[np.ndarray] = []
+        self.biases: List[np.ndarray] = []
+        for fan_in, fan_out in zip(dims[:-1], dims[1:]):
+            self.weights.append(xavier((int(fan_in), int(fan_out))))
+            self.biases.append(np.zeros((int(fan_out),), dtype=np.float32))
+
+    @staticmethod
+    def _current_expected_shapes(hidden_layers: Optional[Sequence[int]] = None) -> Tuple[List[Tuple[int, int]], List[Tuple[int, ...]]]:
+        h = tuple(int(x) for x in (hidden_layers if hidden_layers is not None else HIDDEN_LAYER_SIZES))
+        if not h or any(x <= 0 for x in h):
+            raise ValueError("hidden_layers must contain at least one positive integer width.")
+        dims = [FEATURE_TOTAL] + list(h) + [1]
+        weight_shapes = [(int(a), int(b)) for a, b in zip(dims[:-1], dims[1:])]
+        bias_shapes = [(int(b),) for b in dims[1:]]
+        return weight_shapes, bias_shapes
+
+    @staticmethod
+    def parameter_names(hidden_layers: Optional[Sequence[int]] = None) -> List[str]:
+        weight_shapes, _bias_shapes = MLP._current_expected_shapes(hidden_layers)
+        names: List[str] = []
+        for idx in range(len(weight_shapes)):
+            names.append(f"W{idx + 1}")
+            names.append(f"b{idx + 1}")
+        return names
+
+    def iter_params(self) -> List[Tuple[str, np.ndarray, bool]]:
+        params: List[Tuple[str, np.ndarray, bool]] = []
+        for idx, arr in enumerate(self.weights):
+            params.append((f"W{idx + 1}", arr, True))
+            params.append((f"b{idx + 1}", self.biases[idx], False))
+        return params
 
     def forward(self, x: np.ndarray) -> float:
-        """Compute forward pass returning tanh scalar."""
-        z1 = np.tanh(x.dot(self.W1) + self.b1)
-        z2 = np.tanh(z1.dot(self.W2) + self.b2)
-        z3 = np.tanh(z2.dot(self.W3) + self.b3)
-        out = np.tanh(z3.dot(self.W4) + self.b4)
-        return float(out[0])
+        """Compute forward pass returning a tanh scalar."""
+        z = x
+        for w, b in zip(self.weights, self.biases):
+            z = np.tanh(z.dot(w) + b)
+        return float(z[0])
 
     def copy(self) -> 'MLP':
         new = object.__new__(MLP)
-        new.W1 = self.W1.copy()
-        new.b1 = self.b1.copy()
-        new.W2 = self.W2.copy()
-        new.b2 = self.b2.copy()
-        new.W3 = self.W3.copy()
-        new.b3 = self.b3.copy()
-        new.W4 = self.W4.copy()
-        new.b4 = self.b4.copy()
+        new.input_dim = int(self.input_dim)
+        new.hidden_layers = tuple(self.hidden_layers)
+        new.weights = [w.copy() for w in self.weights]
+        new.biases = [b.copy() for b in self.biases]
         return new
 
     def mutate(self, mutation_rate: float, weight_decay: float, rnd: np.random.RandomState) -> None:
         """Mutate the network in place using Xavier-scaled Gaussian noise."""
         def xavier_scale(arr: np.ndarray, is_weight: bool) -> float:
             if not is_weight:
-                # Biases: just use a small fixed scale
-                return 0.05
+                return MUTATION_BIAS_NOISE_SCALE
             fan_in, fan_out = arr.shape
             limit = np.sqrt(6.0 / float(fan_in + fan_out))
-            # Convert uniform limit to a rough Gaussian std; factor ~0.5 keeps noise modest
-            return float(limit * 0.5)
+            return float(limit * MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER)
 
-        for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3', 'W4', 'b4']:
-            arr: np.ndarray = getattr(self, attr)
-            is_weight = attr.startswith('W')
+        for _name, arr, is_weight in self.iter_params():
             scale = xavier_scale(arr, is_weight=is_weight)
-
-            if scale <= 0.0:
-                continue
-
-            mask = rnd.rand(*arr.shape) < mutation_rate
-            if not mask.any():
-                # still apply weight decay
-                arr -= weight_decay * arr
-                continue
-
-            noise = rnd.randn(*arr.shape).astype(np.float32) * scale
-            arr += mask * noise
+            if scale > 0.0:
+                mask = rnd.rand(*arr.shape) < mutation_rate
+                if mask.any():
+                    noise = rnd.randn(*arr.shape).astype(np.float32) * scale
+                    arr += mask * noise
             arr -= weight_decay * arr
 
     def crossover(self, other: 'MLP', rnd: np.random.RandomState) -> 'MLP':
         """Return a child network from this and another network via uniform crossover."""
-        # Avoid calling __init__ (which does Xavier init we immediately overwrite).
-        child = MLP.__new__(MLP)
+        if tuple(self.hidden_layers) != tuple(other.hidden_layers) or self.input_dim != other.input_dim:
+            raise ValueError(
+                f"Cannot crossover mismatched MLP architectures: "
+                f"{self.architecture_tuple()} vs {other.architecture_tuple()}."
+            )
 
-        for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3', 'W4', 'b4']:
-            a: np.ndarray = getattr(self, attr)
-            b: np.ndarray = getattr(other, attr)
+        child = MLP.__new__(MLP)
+        child.input_dim = int(self.input_dim)
+        child.hidden_layers = tuple(self.hidden_layers)
+        child.weights = []
+        child.biases = []
+
+        for a, b in zip(self.weights, other.weights):
             mask = rnd.rand(*a.shape) < 0.5
-            setattr(child, attr, np.where(mask, a, b).astype(np.float32))
+            child.weights.append(np.where(mask, a, b).astype(np.float32))
+        for a, b in zip(self.biases, other.biases):
+            mask = rnd.rand(*a.shape) < 0.5
+            child.biases.append(np.where(mask, a, b).astype(np.float32))
 
         return child
 
-    def to_dict(self) -> Dict[str, np.ndarray]:
-        return {attr: getattr(self, attr) for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3', 'W4', 'b4']}
+    def architecture_tuple(self) -> Tuple[int, Tuple[int, ...], int]:
+        return (int(self.input_dim), tuple(int(x) for x in self.hidden_layers), 1)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "input_dim": int(self.input_dim),
+            "hidden_layers": list(self.hidden_layers),
+            "output_dim": 1,
+            "weights": [w for w in self.weights],
+            "biases": [b for b in self.biases],
+        }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, np.ndarray]) -> 'MLP':
-        """
-        Construct an MLP directly from parameter arrays without calling __init__.
-        Avoids wasted Xavier initialisation when loading from disk.
-        """
+    def _from_old_style_dict(cls, data: Dict[str, np.ndarray]) -> Optional['MLP']:
+        """Load older W1/b1... payloads if they match the current architecture."""
+        weight_shapes, bias_shapes = cls._current_expected_shapes()
+        weights: List[np.ndarray] = []
+        biases: List[np.ndarray] = []
+        for idx, expected in enumerate(weight_shapes, start=1):
+            key = f"W{idx}"
+            if key not in data:
+                return None
+            arr = np.asarray(data[key], dtype=np.float32)
+            if tuple(arr.shape) != expected:
+                raise ValueError(f"MLP parameter {key!r} has shape {tuple(arr.shape)}, expected {expected}.")
+            weights.append(np.ascontiguousarray(arr, dtype=np.float32))
+        for idx, expected in enumerate(bias_shapes, start=1):
+            key = f"b{idx}"
+            if key not in data:
+                return None
+            arr = np.asarray(data[key], dtype=np.float32)
+            if tuple(arr.shape) != expected:
+                raise ValueError(f"MLP parameter {key!r} has shape {tuple(arr.shape)}, expected {expected}.")
+            biases.append(np.ascontiguousarray(arr, dtype=np.float32))
+
+        expected_keys = {f"W{i}" for i in range(1, len(weight_shapes) + 1)} | {f"b{i}" for i in range(1, len(bias_shapes) + 1)}
+        actual_param_keys = {k for k in data.keys() if isinstance(k, str) and ((k.startswith("W") or k.startswith("b")) and k[1:].isdigit())}
+        if actual_param_keys - expected_keys:
+            raise ValueError(f"MLP payload contains unexpected parameter keys: {sorted(actual_param_keys - expected_keys)}")
+
         net = cls.__new__(cls)
-        for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3', 'W4', 'b4']:
-            arr = np.asarray(data[attr], dtype=np.float32)
-            # Ensure we own writable storage (pickle can give odd flags sometimes)
-            if not arr.flags.writeable:
-                arr = arr.copy()
-            setattr(net, attr, arr)
+        net.input_dim = FEATURE_TOTAL
+        net.hidden_layers = tuple(HIDDEN_LAYER_SIZES)
+        net.weights = weights
+        net.biases = biases
         return net
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> 'MLP':
+        """
+        Construct an MLP directly from parameter arrays without calling __init__.
+
+        Strictly validates against the currently configured hidden architecture.
+        Corrupt or mismatched snapshots are rejected rather than reshaped.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("MLP.from_dict expected a dict of parameter arrays.")
+
+        if "weights" not in data or "biases" not in data:
+            old_loaded = cls._from_old_style_dict(data)  # type: ignore[arg-type]
+            if old_loaded is not None:
+                return old_loaded
+            raise ValueError("MLP payload must contain weights/biases or matching W1/b1... arrays.")
+
+        input_dim = int(data.get("input_dim", FEATURE_TOTAL) or FEATURE_TOTAL)
+        output_dim = int(data.get("output_dim", 1) or 1)
+        hidden_layers = tuple(int(x) for x in data.get("hidden_layers", HIDDEN_LAYER_SIZES))
+        if input_dim != FEATURE_TOTAL:
+            raise ValueError(f"MLP input_dim {input_dim} does not match required {FEATURE_TOTAL}.")
+        if output_dim != 1:
+            raise ValueError(f"MLP output_dim {output_dim} does not match required 1.")
+        if tuple(hidden_layers) != tuple(HIDDEN_LAYER_SIZES):
+            raise ValueError(
+                f"MLP hidden_layers {tuple(hidden_layers)} do not match configured {tuple(HIDDEN_LAYER_SIZES)}."
+            )
+
+        raw_weights = data.get("weights")
+        raw_biases = data.get("biases")
+        if not isinstance(raw_weights, (list, tuple)) or not isinstance(raw_biases, (list, tuple)):
+            raise ValueError("MLP weights and biases must be lists/tuples of arrays.")
+
+        expected_weight_shapes, expected_bias_shapes = cls._current_expected_shapes(hidden_layers)
+        if len(raw_weights) != len(expected_weight_shapes) or len(raw_biases) != len(expected_bias_shapes):
+            raise ValueError(
+                f"MLP payload has {len(raw_weights)} weights/{len(raw_biases)} biases; "
+                f"expected {len(expected_weight_shapes)}/{len(expected_bias_shapes)}."
+            )
+
+        weights: List[np.ndarray] = []
+        biases: List[np.ndarray] = []
+        for idx, (arr0, expected) in enumerate(zip(raw_weights, expected_weight_shapes), start=1):
+            arr = np.asarray(arr0, dtype=np.float32)
+            if tuple(arr.shape) != expected:
+                raise ValueError(f"MLP weight W{idx} has shape {tuple(arr.shape)}, expected {expected}.")
+            weights.append(np.ascontiguousarray(arr, dtype=np.float32))
+        for idx, (arr0, expected) in enumerate(zip(raw_biases, expected_bias_shapes), start=1):
+            arr = np.asarray(arr0, dtype=np.float32)
+            if tuple(arr.shape) != expected:
+                raise ValueError(f"MLP bias b{idx} has shape {tuple(arr.shape)}, expected {expected}.")
+            biases.append(np.ascontiguousarray(arr, dtype=np.float32))
+
+        net = cls.__new__(cls)
+        net.input_dim = input_dim
+        net.hidden_layers = hidden_layers
+        net.weights = weights
+        net.biases = biases
+        return net
 
 ###############################################################################
 #  Agent
@@ -1781,7 +2360,11 @@ class Agent:
             winner, undo = board.apply_move_with_undo(mv)
             try:
                 if winner is not None:
-                    score = 1e6 if winner == color else -1e6
+                    score = TERMINAL_WIN_SCORE if winner == color else -TERMINAL_WIN_SCORE
+                elif board.check_draw():
+                    # Terminal draws should be valued as neutral, rather than
+                    # asking the evaluator to imagine value beyond the game end.
+                    score = 0.0
                 else:
                     v = self.evaluate_state(board)
                     score = v if color == 'w' else -v
@@ -1797,8 +2380,9 @@ class Agent:
         norms = [(s - worst) / (best - worst) for s in scores]
         filtered: List[Tuple[Move, float]] = []
         for mv, n in zip(legal, norms):
-            if n > 0.8:
-                weight = (n - 0.8) / 0.2
+            if n > MOVE_CHOICE_THRESHOLD:
+                denom = max(1e-12, 1.0 - MOVE_CHOICE_THRESHOLD)
+                weight = (n - MOVE_CHOICE_THRESHOLD) / denom
                 filtered.append((mv, weight))
 
         if not filtered:
@@ -1887,6 +2471,105 @@ def load_parents(filepath: str) -> List[Agent]:
         )
     return parents
 
+
+def _mlp_fingerprint(net: MLP) -> str:
+    """Return a compact deterministic fingerprint for an MLP's architecture and parameter arrays."""
+    h = hashlib.sha1()
+    h.update(str(net.architecture_tuple()).encode("ascii"))
+    for name, arr, _is_weight in net.iter_params():
+        arr2 = np.asarray(arr, dtype=np.float32)
+        h.update(name.encode("ascii"))
+        h.update(str(arr2.shape).encode("ascii"))
+        h.update(arr2.tobytes(order="C"))
+    return h.hexdigest()
+
+def _parents_fingerprint(parents: Sequence[Agent]) -> str:
+    """Return a deterministic fingerprint for an ordered parent list."""
+    h = hashlib.sha1()
+    h.update(str(len(parents)).encode("ascii"))
+    for agent in parents:
+        h.update(str(agent.name).encode("utf-8"))
+        h.update(_mlp_fingerprint(agent.net).encode("ascii"))
+    return h.hexdigest()
+
+
+def _population_fingerprint(population: Sequence[Agent]) -> str:
+    """Return a compact identity fingerprint for an ordered GA population."""
+    return _parents_fingerprint(population)
+
+
+def _net_payload_fingerprint(net_dict: object) -> Optional[str]:
+    if not isinstance(net_dict, dict):
+        return None
+    try:
+        net = MLP.from_dict(net_dict)
+        return _mlp_fingerprint(net)
+    except Exception:
+        return None
+
+def _champion_payload_fingerprint(payload: object) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    net_fp = _net_payload_fingerprint(payload.get("net"))
+    if net_fp is None:
+        return None
+    h = hashlib.sha1()
+    h.update(str(payload.get("name", "unknown")).encode("utf-8"))
+    h.update(net_fp.encode("ascii"))
+    return h.hexdigest()
+
+
+def _parents_payload_fingerprint(payload: object) -> Optional[str]:
+    if not isinstance(payload, list):
+        return None
+    h = hashlib.sha1()
+    h.update(str(len(payload)).encode("ascii"))
+    for entry in payload:
+        if not isinstance(entry, dict):
+            return None
+        net_fp = _net_payload_fingerprint(entry.get("net"))
+        if net_fp is None:
+            return None
+        h.update(str(entry.get("name", "unknown")).encode("utf-8"))
+        h.update(net_fp.encode("ascii"))
+    return h.hexdigest()
+
+
+def _champion_agent_fingerprint(agent: Agent) -> str:
+    h = hashlib.sha1()
+    h.update(str(agent.name).encode("utf-8"))
+    h.update(_mlp_fingerprint(agent.net).encode("ascii"))
+    return h.hexdigest()
+
+
+def save_parents_verified(parents: List[Agent], filepath: str, *, label: str = "parents") -> None:
+    """
+    Save a parent list and prove the file reloads as the same ordered networks.
+
+    This is intentionally stricter than save_parents(), which remains best-effort
+    for best-effort/noncritical call sites.  Use this for safety-critical _0/_1 parent
+    snapshots that later control resumability and rotation.
+    """
+    expected_count = len(parents)
+    expected_fingerprint = _parents_fingerprint(parents)
+
+    serial = _serialise_parents_payload(parents)
+    _safe_write_pickle(filepath, serial, durable=True)
+
+    reloaded = load_parents(filepath)
+    if len(reloaded) != expected_count or not reloaded:
+        raise RuntimeError(
+            f"Verified save failed for {label} at {filepath!r}: "
+            f"reloaded {len(reloaded)} parents, expected {expected_count}."
+        )
+
+    actual_fingerprint = _parents_fingerprint(reloaded)
+    if actual_fingerprint != expected_fingerprint:
+        raise RuntimeError(
+            f"Verified save failed for {label} at {filepath!r}: "
+            f"reloaded parent fingerprint does not match written parents."
+        )
+
 def save_champion(agent: Agent, filepath: str) -> None:
     data = {
         "name": agent.name,
@@ -1897,6 +2580,39 @@ def save_champion(agent: Agent, filepath: str) -> None:
         _safe_write_pickle(filepath, data, durable=True)
     except Exception:
         pass
+
+
+def save_champion_verified(agent: Agent, filepath: str, *, label: str = "champion") -> None:
+    """
+    Save one champion and prove the file reloads as the same network.
+
+    This is used for safety-critical _2/_3/_4 initial/prelude snapshots.
+    """
+    expected_name = str(agent.name)
+    expected_fingerprint = _mlp_fingerprint(agent.net)
+    data = {
+        "name": agent.name,
+        "trainable": False,
+        "net": agent.net.to_dict(),
+    }
+    _safe_write_pickle(filepath, data, durable=True)
+
+    reloaded = load_champion(filepath)
+    if reloaded is None:
+        raise RuntimeError(
+            f"Verified champion save failed for {label} at {filepath!r}: reload returned None."
+        )
+    if str(reloaded.name) != expected_name:
+        raise RuntimeError(
+            f"Verified champion save failed for {label} at {filepath!r}: "
+            f"reloaded name {reloaded.name!r}, expected {expected_name!r}."
+        )
+    if _mlp_fingerprint(reloaded.net) != expected_fingerprint:
+        raise RuntimeError(
+            f"Verified champion save failed for {label} at {filepath!r}: "
+            f"reloaded champion fingerprint does not match written champion."
+        )
+
 
 def load_champion(filepath: str) -> Optional[Agent]:
     data = _safe_read_pickle(filepath)
@@ -1925,9 +2641,13 @@ def load_champion(filepath: str) -> Optional[Agent]:
 
 def save_population_state(name: str, population: List[Agent], gen: int, base_dir: str) -> None:
     path = os.path.join(base_dir, f"{name}_0.pkl")
+    expected_count = len(population)
+    expected_fingerprint = _population_fingerprint(population)
     serial = {
         "kind": "population",
         "generation": int(gen),
+        "population_count": int(expected_count),
+        "population_fingerprint": expected_fingerprint,
         "agents": [
             {
                 "name": agent.name,
@@ -1939,8 +2659,18 @@ def save_population_state(name: str, population: List[Agent], gen: int, base_dir
     }
     try:
         _safe_write_pickle(path, serial, durable=True)
-    except Exception:
-        pass
+        reloaded = load_population_state(name, base_dir)
+        if reloaded is None:
+            raise RuntimeError("reload returned None")
+        loaded_population, loaded_gen = reloaded
+        if int(loaded_gen) != int(gen):
+            raise RuntimeError(f"reloaded generation {loaded_gen}, expected {gen}")
+        if len(loaded_population) != expected_count:
+            raise RuntimeError(f"reloaded {len(loaded_population)} nets, expected {expected_count}")
+        if _population_fingerprint(loaded_population) != expected_fingerprint:
+            raise RuntimeError("reloaded population fingerprint mismatch")
+    except Exception as e:
+        _raise_checkpoint_write_failure("write population state", path, e)
 
 def load_population_state(name: str, base_dir: str) -> Optional[Tuple[List[Agent], int]]:
     path = os.path.join(base_dir, f"{name}_0.pkl")
@@ -1948,21 +2678,57 @@ def load_population_state(name: str, base_dir: str) -> Optional[Tuple[List[Agent
     if not (isinstance(data, dict) and data.get("kind") == "population"):
         return None
 
-    gen = int(data.get("generation", 0) or 0)
-    agents_data = data.get("agents")
-    if not isinstance(agents_data, list):
+    try:
+        gen = int(data.get("generation", 0) or 0)
+    except Exception:
+        try:
+            log(f"[{name}] WARNING: rejecting saved population with invalid generation at {path!r}.")
+        except Exception:
+            pass
         return None
 
+    agents_data = data.get("agents")
+    if not isinstance(agents_data, list):
+        try:
+            log(f"[{name}] WARNING: rejecting saved population with missing/invalid agents list at {path!r}.")
+        except Exception:
+            pass
+        return None
+
+    expected_count = data.get("population_count")
+    if expected_count is not None:
+        try:
+            if int(expected_count) != len(agents_data):
+                log(f"[{name}] WARNING: rejecting saved population count mismatch at {path!r}.")
+                return None
+        except Exception:
+            return None
+
     population: List[Agent] = []
-    for ad in agents_data:
+    for idx, ad in enumerate(agents_data):
         if not isinstance(ad, dict):
-            continue
+            try:
+                log(f"[{name}] WARNING: rejecting saved population; entry {idx} is not a dict at {path!r}.")
+            except Exception:
+                pass
+            return None
 
         net_dict = ad.get("net")
+        if not isinstance(net_dict, dict):
+            try:
+                log(f"[{name}] WARNING: rejecting saved population; entry {idx} has no valid net payload at {path!r}.")
+            except Exception:
+                pass
+            return None
+
         try:
-            net = MLP.from_dict(net_dict) if isinstance(net_dict, dict) else MLP()
-        except Exception:
-            net = MLP()
+            net = MLP.from_dict(net_dict)
+        except Exception as e:
+            try:
+                log(f"[{name}] WARNING: rejecting saved population; entry {idx} net failed validation at {path!r}: {e!r}.")
+            except Exception:
+                pass
+            return None
 
         population.append(
             Agent(
@@ -1973,6 +2739,18 @@ def load_population_state(name: str, base_dir: str) -> Optional[Tuple[List[Agent
         )
 
     if not population:
+        try:
+            log(f"[{name}] WARNING: rejecting saved population with zero loadable agents at {path!r}.")
+        except Exception:
+            pass
+        return None
+
+    stored_fp = data.get("population_fingerprint")
+    if stored_fp is not None and _population_fingerprint(population) != str(stored_fp):
+        try:
+            log(f"[{name}] WARNING: rejecting saved population fingerprint mismatch at {path!r}.")
+        except Exception:
+            pass
         return None
 
     return population, gen
@@ -2020,9 +2798,11 @@ def evaluate_population_stage1(
     # ------------------------------------------------------------------
     # Load or initialise GA Stage-1 progress
     # ------------------------------------------------------------------
+    population_fp = _population_fingerprint(pop)
     progress = load_ga_progress()
     valid = False
     if progress is not None:
+        stored_population_fp = progress.get("population_fingerprint")
         if (
             progress.get("cycle") == CURRENT_CYCLE
             and progress.get("agent") == CURRENT_AGENT_NAME
@@ -2030,8 +2810,15 @@ def evaluate_population_stage1(
             and progress.get("n_candidates") == n
             and progress.get("n_opponents") == m
             and progress.get("n1") == n_per_colour
+            and (stored_population_fp in (None, population_fp))
         ):
             valid = True
+            # Older progress files did not include this.  If dimensions match,
+            # bind the progress file to the currently loaded population.
+            if stored_population_fp is None:
+                progress["population_fingerprint"] = population_fp
+                save_ga_progress(progress)
+                check_stop(stop_event, ga_progress=progress)
 
     if not valid:
         # Fresh Stage-1 progress
@@ -2043,6 +2830,7 @@ def evaluate_population_stage1(
             "generation": CURRENT_GEN,
             "n_candidates": n,
             "n_opponents": m,
+            "population_fingerprint": population_fp,
             "n1": n_per_colour,
             # Default n2; Stage-2 may overwrite/extend this.
             "n2": 8,
@@ -2117,6 +2905,7 @@ def evaluate_population_stage1(
                 f"[{CURRENT_AGENT_NAME}] cyc {CURRENT_CYCLE} gen {CURRENT_GEN} "
                 f"stage1 game {current_game}/{total_games} "
                 f"(agent {i+1}/{n} vs {opp.name}, {role})"
+                f"{_ga_eta_status_suffix(progress, 'stage1')}"
             )
 
         # Play a single Battledance game and update margin/draws.
@@ -2253,6 +3042,7 @@ def refine_top_candidates(
         or progress.get("generation") != CURRENT_GEN
         or progress.get("n_candidates") != n
         or progress.get("n_opponents") != m
+        or progress.get("population_fingerprint") not in (None, _population_fingerprint(pop))
         or progress.get("n1") != n1_per_colour
         or progress.get("n2") != n2_per_colour
     ):
@@ -2266,6 +3056,7 @@ def refine_top_candidates(
             "generation": CURRENT_GEN,
             "n_candidates": n,
             "n_opponents": m,
+            "population_fingerprint": _population_fingerprint(pop),
             "n1": n1_per_colour,
             "n2": n2_per_colour,
             "stage": "stage2",
@@ -2296,6 +3087,11 @@ def refine_top_candidates(
         }
         save_ga_progress(progress)
         check_stop(stop_event, ga_progress=progress)
+    if progress.get("population_fingerprint") is None:
+        progress["population_fingerprint"] = _population_fingerprint(pop)
+        save_ga_progress(progress)
+        check_stop(stop_event, ga_progress=progress)
+
     stage = progress.get("stage", "stage1_complete")
 
     # Ensure Stage-1 snapshot stats are present (for candidates outside top_indices)
@@ -2410,6 +3206,7 @@ def refine_top_candidates(
             f"[{CURRENT_AGENT_NAME}] cyc {CURRENT_CYCLE} gen {CURRENT_GEN} "
             f"stage2 game {current_game}/{total_games} "
             f"(cand_idx {idx} vs {opp.name}, {role})"
+            f"{_ga_eta_status_suffix(progress, 'stage2')}"
         )
 
         # Play a single Battledance game and update Stage-2 snapshot stats
@@ -2501,62 +3298,41 @@ def _coerce_to_8_parents(
     *,
     fallback_name: str,
 ) -> List[Agent]:
-    """
-    Ensure we have exactly 8 parent Agents.
-
-    - If >= 8: truncate.
-    - If 1..7: pad by cloning existing parents (chosen via rnd).
-    - If 0: synthesize 8 fresh Xavier-initialised parents (rare; indicates corrupt/missing parents file).
-    """
-    if len(parents) >= 8:
-        return parents[:8]
-
-    if len(parents) == 0:
-        # Last-resort: make 8 fresh parents so the run doesn't crash.
-        # This is intentionally non-deterministic across runs unless rnd is seeded.
-        fresh: List[Agent] = []
-        for _ in range(8):
-            net_seed = int(rnd.randint(0, 2**31 - 1))
-            fresh.append(
-                Agent(
-                    name=fallback_name,
-                    net=MLP(input_dim=594, hidden_dim=512, seed=net_seed),
-                    trainable=False,
-                )
-            )
-        log(f"[{fallback_name}] WARNING: parent list empty; synthesised 8 fresh parents.")
-        return fresh
-
-    out: List[Agent] = list(parents)
-    while len(out) < 8:
-        k = int(rnd.randint(0, len(out)))
-        out.append(out[k].clone())
-        out[-1].trainable = False
-    return out
+    """Return the canonical configured parent pool, refusing damaged parent sets."""
+    if len(parents) != PARENT_COUNT:
+        raise RuntimeError(
+            f"[{fallback_name}] canonical parent set must contain exactly {PARENT_COUNT} loadable parents; "
+            f"loaded {len(parents)}. Refusing to synthesize, truncate, or pad parents."
+        )
+    return list(parents)
 
 def build_children(parents: List[Agent], rnd: np.random.RandomState) -> List[Agent]:
     """
-    Generate 256 non-elite children from (up to) 8 parents using a uniform
+    Generate non-elite children from the configured parent pool using a uniform
     crossover grid.
 
-    Robustness: if parents != 8 due to corrupted/legacy files, we pad/truncate
-    so training continues instead of crashing.
+    Canonical safety: the parent set must contain exactly PARENT_COUNT loadable
+    parents. Damaged or incomplete parent files raise instead of being padded.
     """
     fallback_name = parents[0].name if parents else (CURRENT_AGENT_NAME or "unknown")
-    parents8 = _coerce_to_8_parents(parents, rnd, fallback_name=fallback_name)
+    parentsN = _coerce_to_8_parents(parents, rnd, fallback_name=fallback_name)
 
     children: List[Agent] = []
-    for i in range(8):
-        for j in range(8):
-            p1 = parents8[i]
-            p2 = parents8[j]
-            for _ in range(4):
+    for i in range(PARENT_COUNT):
+        for j in range(PARENT_COUNT):
+            p1 = parentsN[i]
+            p2 = parentsN[j]
+            for _ in range(CHILDREN_PER_PARENT_INTERSECTION):
                 child_net = p1.net.crossover(p2.net, rnd)
-                child_net.mutate(mutation_rate=0.015625, weight_decay=0.00001526, rnd=rnd)
+                child_net.mutate(
+                    mutation_rate=_schedule_value(MUTATION_RATE_SCHEDULE, CURRENT_CYCLE),
+                    weight_decay=_schedule_value(WEIGHT_DECAY_SCHEDULE, CURRENT_CYCLE),
+                    rnd=rnd,
+                )
                 children.append(Agent(name=p1.name, net=child_net, trainable=True))
 
-    # Sanity: 256 children
-    assert len(children) == 256, f"Expected 256 children, got {len(children)}"
+    expected_children = PARENT_COUNT * PARENT_COUNT * CHILDREN_PER_PARENT_INTERSECTION
+    assert len(children) == expected_children, f"Expected {expected_children} children, got {len(children)}"
     return children
 
 def build_population_from_parents(
@@ -2565,26 +3341,24 @@ def build_population_from_parents(
     rnd: np.random.RandomState,
 ) -> List[Agent]:
     """
-    Given a parent set, build a 260-net GA population:
+    Given a parent set, build the configured GA population:
 
-      * 256 children produced via crossover/mutation of an 8-parent pool.
-      * 4 elite direct clones of the top four parents.
+      * PARENT_COUNT^2 * CHILDREN_PER_PARENT_INTERSECTION children.
+      * ELITE_COUNT direct clones of the top parents.
 
-    Robustness: parents are coerced to exactly 8 so legacy/corrupt files
-    do not crash the run.
+    Canonical safety: parent files must provide exactly PARENT_COUNT loadable
+    parents; malformed/corrupt parent sets raise instead of being patched over.
     """
-    parents8 = _coerce_to_8_parents(parents, rnd, fallback_name=(name or CURRENT_AGENT_NAME or "unknown"))
+    parentsN = _coerce_to_8_parents(parents, rnd, fallback_name=(name or CURRENT_AGENT_NAME or "unknown"))
 
-    # 256 mutated children from the full 8-parent grid
-    children = build_children(parents8, rnd)
+    children = build_children(parentsN, rnd)
 
     pop: List[Agent] = []
     pop.extend(children)
 
-    # 4 elites as direct clones of the top four parents
     elites: List[Agent] = []
-    for i in range(4):
-        elite = parents8[i].clone()
+    for i in range(min(ELITE_COUNT, len(parentsN))):
+        elite = parentsN[i].clone()
         elite.trainable = True
         elites.append(elite)
 
@@ -2626,8 +3400,8 @@ def train_population_once(
         return pop, [], False
 
     n_candidates = len(pop)
-    n1 = 2   # cheap pass: 4 games per snapshot
-    n2 = 16  # heavy pass: 32 games per snapshot
+    n1 = int(STAGE1_ROUNDS)
+    n2 = int(STAGE2_ROUNDS)
 
     # ------------------------------------------------------------------
     # Stage 1: cheap evaluation for the whole population
@@ -2652,31 +3426,38 @@ def train_population_once(
     indices = list(range(n_candidates))
     indices.sort(key=lambda i: (-fitness_base_1[i], i))
 
-    # Top K finalists for heavy evaluation
-    K = min(12, n_candidates)
+    # Top K finalists for heavy evaluation.  If STAGE2_FINALISTS <= PARENT_COUNT,
+    # Stage 2 is skipped and Stage 1 directly chooses parents.
+    K = min(max(int(STAGE2_FINALISTS), PARENT_COUNT), n_candidates)
     top_indices = indices[:K]
 
     # ------------------------------------------------------------------
-    # Stage 2: heavy evaluation for the top K, adding 14/colour to reach 32
+    # Stage 2: heavy evaluation for the top K, unless configured as skipped.
     # ------------------------------------------------------------------
-    ordered_indices, sum_margins_2, min_margins_2, snapshot_stats_2 = refine_top_candidates(
-        pop,
-        opponents,
-        env,
-        top_indices,
-        snapshot_stats_1,
-        n1_per_colour=n1,
-        n2_per_colour=n2,
-        use_worst_only=use_worst_only,
-        stop_event=stop_event,
-    )
+    if int(STAGE2_FINALISTS) <= PARENT_COUNT or n2 <= n1:
+        ordered_indices = indices[:min(PARENT_COUNT, n_candidates)]
+        sum_margins_2 = {i: sum_margins_1[i] for i in ordered_indices}
+        min_margins_2 = {i: min_margins_1[i] for i in ordered_indices}
+        snapshot_stats_2 = {i: snapshot_stats_1[i] for i in ordered_indices}
+    else:
+        ordered_indices, sum_margins_2, min_margins_2, snapshot_stats_2 = refine_top_candidates(
+            pop,
+            opponents,
+            env,
+            top_indices,
+            snapshot_stats_1,
+            n1_per_colour=n1,
+            n2_per_colour=n2,
+            use_worst_only=use_worst_only,
+            stop_event=stop_event,
+        )
 
     if not ordered_indices:
         # Should not happen, but be defensive.
         return pop, [], False
 
     # Parents = top 8 of Stage-2 ordering (or fewer if population is tiny)
-    parent_count = min(8, len(ordered_indices))
+    parent_count = min(PARENT_COUNT, len(ordered_indices))
     parent_indices = ordered_indices[:parent_count]
     parents: List[Agent] = [pop[i].clone() for i in parent_indices]
 
@@ -2767,6 +3548,132 @@ def train_population_once(
 #  Champion matches and rotation
 ###############################################################################
 
+
+def _expected_champion_match_schedule(
+    name: str,
+    opponent_lists: Dict[str, List[str]],
+) -> List[Tuple[str, int, str]]:
+    """Return the canonical flattened champion-match schedule for one agent."""
+    schedule: List[Tuple[str, int, str]] = []
+    for opp_name in opponent_lists.get(name, []):
+        for snap in TRAINING_SNAPSHOT_INDICES:
+            schedule.append((str(opp_name), int(snap), "W"))
+            schedule.append((str(opp_name), int(snap), "B"))
+    return schedule
+
+
+def _parse_champion_match_header(header: str) -> Optional[Dict[str, object]]:
+    if not isinstance(header, str) or not header.startswith("Cycle: "):
+        return None
+    parts = header.split()
+    fields: Dict[str, object] = {}
+    expected_keys = {"Cycle:", "Name:", "Opp:", "Snapshot:", "ChampColor:", "Result:"}
+    i = 0
+    while i + 1 < len(parts):
+        key = parts[i]
+        val = parts[i + 1]
+        if key in expected_keys:
+            fields[key[:-1]] = val
+            i += 2
+        else:
+            i += 1
+    try:
+        parsed = {
+            "cycle": int(fields["Cycle"]),
+            "name": str(fields["Name"]),
+            "opp": str(fields["Opp"]),
+            "snapshot": int(fields["Snapshot"]),
+            "champ_color": str(fields["ChampColor"]),
+            "result": int(fields["Result"]),
+        }
+    except Exception:
+        return None
+    if parsed["champ_color"] not in ("W", "B"):
+        return None
+    if parsed["result"] not in (-1, 0, 1):
+        return None
+    return parsed
+
+
+def _champion_match_header_matches_schedule(
+    header: str,
+    *,
+    cycle: int,
+    name: str,
+    schedule_entry: Tuple[str, int, str],
+) -> bool:
+    parsed = _parse_champion_match_header(header)
+    if parsed is None:
+        return False
+    opp_name, snap, color = schedule_entry
+    return (
+        parsed.get("cycle") == int(cycle)
+        and parsed.get("name") == str(name)
+        and parsed.get("opp") == str(opp_name)
+        and parsed.get("snapshot") == int(snap)
+        and parsed.get("champ_color") == str(color)
+        and parsed.get("result") in (-1, 0, 1)
+    )
+
+
+def _champion_match_valid_log_prefix(
+    path: str,
+    *,
+    cycle: int,
+    name: str,
+    schedule: Sequence[Tuple[str, int, str]],
+) -> List[Tuple[str, str]]:
+    """Return the longest valid two-line-per-game prefix of a champion log."""
+    lines: List[str] = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            lines = []
+
+    records: List[Tuple[str, str]] = []
+    i = 0
+    while i + 1 < len(lines) and len(records) < len(schedule):
+        header = lines[i]
+        moves = lines[i + 1]
+        expected = schedule[len(records)]
+        if not _champion_match_header_matches_schedule(
+            header,
+            cycle=cycle,
+            name=name,
+            schedule_entry=expected,
+        ):
+            break
+        records.append((header, moves))
+        i += 2
+    return records
+
+
+def _rewrite_champion_match_log_prefix(path: str, records: Sequence[Tuple[str, str]]) -> None:
+    text = "".join(f"{header}\n{moves}\n" for header, moves in records)
+    _safe_write_text(path, text, durable=True)
+
+
+def _champion_match_log_complete_for_agent(
+    *,
+    base_dir: str,
+    cycle: int,
+    name: str,
+    opponent_lists: Dict[str, List[str]],
+) -> bool:
+    schedule = _expected_champion_match_schedule(name, opponent_lists)
+    if not schedule:
+        return True
+    path = _sample_game_path(base_dir, f"champion_matches_{name}.txt")
+    records = _champion_match_valid_log_prefix(
+        path,
+        cycle=cycle,
+        name=name,
+        schedule=schedule,
+    )
+    return len(records) == len(schedule)
+
 def run_champion_matches(
     name: str,
     parents: List[Agent],
@@ -2777,61 +3684,46 @@ def run_champion_matches(
     outfile_path: str,
     stop_event=None,
 ) -> None:
-    """
-    Run champion matches for a single agent `name` immediately after its GA
-    training completes, with per-agent logging and per-agent resumability.
-
-    Champion of `name` is parents[0]. For each Opp in opponent_lists[name],
-    and for each snapshot index s ∈ SNAPSHOT_INDICES, we attempt to load the champion
-    from Opp_s and, if successful, schedule two games (champ as White, champ
-    as Black).
-
-    Checkpointing semantics (per agent):
-
-      * champion_progress_<name>.json tracks, for this cycle, how many
-        champion-match games have already been completed.
-      * Games are flattened into a linear schedule of length T:
-            [ (Opp1, s1, W), (Opp1, s1, B),
-              (Opp1, s2, W), (Opp1, s2, B),
-              ...
-            ]
-        The index in this schedule is `game_index`.
-      * progress["next_index"] = n means that games [0..n-1] have been fully
-        completed and logged for this agent in this cycle.
-
-    Logging:
-
-      * Each agent logs to its own file: champion_matches_<Name>.txt
-        (two lines per game: header + moves).
-      * On resume, we truncate that log to the first `next_index` games
-        to drop any partial tails.
-    """
-    if not parents:
-        log(f"[{name}] cycle {cycle}: no parents available for champion matches.")
-        return
+    """Run strict, resumable champion audit matches for one agent."""
+    if len(parents) != PARENT_COUNT:
+        raise RuntimeError(
+            f"[{name}] cycle {cycle}: expected {PARENT_COUNT} parents for champion matches; loaded {len(parents)}."
+        )
 
     champ = parents[0]
 
-    # Preload all usable opponent snapshots once and build the schedule.
     snapshot_agents: Dict[Tuple[str, int], Agent] = {}
-    schedule: List[Tuple[str, int, str]] = []
+    schedule = _expected_champion_match_schedule(name, opponent_lists)
+    problems: List[str] = []
 
     for opp_name in opponent_lists.get(name, []):
-        for s in SNAPSHOT_INDICES:
+        for s in TRAINING_SNAPSHOT_INDICES:
             opp_path = os.path.join(base_dir, f"{opp_name}_{s}.pkl")
-            if not os.path.exists(opp_path):
+            if not _path_exists_respecting_transient_storage(opp_path):
+                problems.append(f"missing {opp_name}_{s} at {opp_path!r}")
                 continue
 
             opp_champ = load_champion(opp_path)
             if opp_champ is None:
                 plist = load_parents(opp_path)
-                if not plist:
-                    continue
-                opp_champ = plist[0]
+                if plist:
+                    opp_champ = plist[0]
 
-            snapshot_agents[(opp_name, s)] = opp_champ
-            schedule.append((opp_name, s, "W"))
-            schedule.append((opp_name, s, "B"))
+            if opp_champ is None:
+                problems.append(f"unloadable {opp_name}_{s} at {opp_path!r}")
+                continue
+
+            snapshot_agents[(opp_name, int(s))] = opp_champ
+
+    expected_snapshots = len(opponent_lists.get(name, [])) * len(TRAINING_SNAPSHOT_INDICES)
+    if problems or len(snapshot_agents) != expected_snapshots:
+        detail = "; ".join(problems[:12])
+        if len(problems) > 12:
+            detail += f"; ... +{len(problems) - 12} more"
+        raise RuntimeError(
+            f"[{name}] cycle {cycle}: expected {expected_snapshots} champion-match opponent snapshots, "
+            f"loaded {len(snapshot_agents)}. {detail}"
+        )
 
     total_games = len(schedule)
     if total_games == 0:
@@ -2841,72 +3733,37 @@ def run_champion_matches(
 
     os.makedirs(os.path.dirname(outfile_path), exist_ok=True)
 
-    # Load per-agent champion progress for this cycle
+    valid_records = _champion_match_valid_log_prefix(
+        outfile_path,
+        cycle=cycle,
+        name=name,
+        schedule=schedule,
+    )
+    next_index = min(len(valid_records), total_games)
+    try:
+        _rewrite_champion_match_log_prefix(outfile_path, valid_records[:next_index])
+    except Exception as e:
+        _raise_checkpoint_write_failure("rewrite champion match log prefix", outfile_path, e)
+
     progress = load_champion_progress(base_dir, cycle, name)
-    next_index = int(progress.get("next_index", 0) or 0)
-    if next_index < 0:
-        next_index = 0
-    if next_index > total_games:
-        next_index = total_games
-    progress["cycle"] = cycle
-    progress["next_index"] = next_index
+    progress["cycle"] = int(cycle)
+    progress["next_index"] = int(next_index)
     save_champion_progress(base_dir, name, progress)
     check_stop(stop_event)
-    # Truncate this agent's log file to the first `next_index` complete games,
-    # robustly: scan for header lines and take the following moves line.
-    existing: List[str] = []
-    if os.path.exists(outfile_path):
-        try:
-            with open(outfile_path, "r", encoding="utf-8") as f:
-                existing = f.read().splitlines()
-        except Exception:
-            existing = []
 
-    games: List[Tuple[str, str]] = []
-    i = 0
-    while i + 1 < len(existing):
-        line = existing[i]
-        if line.startswith("Cycle: "):
-            header = existing[i]
-            moves = existing[i + 1]
-            games.append((header, moves))
-            i += 2
-        else:
-            # Skip stray/extra lines (future-proofing)
-            i += 1
-
-    completed_games = min(next_index, len(games))
-    trimmed: List[str] = []
-    for header, moves in games[:completed_games]:
-        trimmed.append(header)
-        trimmed.append(moves)
-
-    try:
-        with open(outfile_path, "w", encoding="utf-8") as f:
-            if trimmed:
-                f.write("\n".join(trimmed) + "\n")
-    except Exception:
-        # Logging must not crash training
-        pass
-
-    # Replay / resume over the schedule.
     game_index = 0
     for opp_name, s, color in schedule:
         check_stop(stop_event)
-        # Skip games already recorded as completed.
         if game_index < next_index:
             game_index += 1
             continue
 
-        opp_champ = snapshot_agents[(opp_name, s)]
-
-        # Status line for this game
+        opp_champ = snapshot_agents[(opp_name, int(s))]
         status(
             f"[{name}] cyc {cycle} champ game {game_index + 1}/{total_games} "
             f"vs {opp_name}_{s} ({color})"
         )
 
-        # Play game with correct colour assignment
         if color == "W":
             result_raw, moves_str = play_game_with_moves(champ, opp_champ, env)
             result = result_raw
@@ -2918,29 +3775,21 @@ def run_champion_matches(
             f"Cycle: {cycle} Name: {name} Opp: {opp_name} "
             f"Snapshot: {s} ChampColor: {color} Result: {result}"
         )
-
-        # Append header + moves to the per-agent log (append-only, per-game)
         try:
-            with open(outfile_path, "a", encoding="utf-8") as f:
-                f.write(header + "\n")
-                f.write(moves_str + "\n")
-        except Exception:
-            # Logging must not crash training; still advance progress.
-            pass
+            _append_text_with_retry(outfile_path, header + "\n" + moves_str + "\n", durable=True)
+        except Exception as e:
+            _raise_checkpoint_write_failure("append champion match log", outfile_path, e)
 
-        # Silent detailed log line
         log(
             f"[{name}] cycle {cycle}: champ vs {opp_name}_{s} as {color} -> result {result}",
             also_print=False,
         )
 
         game_index += 1
-
-        # Update champion_progress after each completed game
         progress["next_index"] = game_index
         save_champion_progress(base_dir, name, progress)
         check_stop(stop_event)
-    # Clean up the status line with a newline at the end of champion matches
+
     status_newline()
 
 def play_game_with_moves(agent1: Agent, agent2: Agent, env: BattledanceEnvironment) -> Tuple[int, str]:
@@ -3025,6 +3874,49 @@ def play_game_with_moves(agent1: Agent, agent2: Agent, env: BattledanceEnvironme
 #  Per-agent training helper (for single- and multi-thread modes)
 ###############################################################################
 
+def _load_required_opponent_snapshot_champions(
+    *,
+    name: str,
+    opponent_lists: Dict[str, List[str]],
+    base_dir: str,
+    context: str,
+) -> List[Agent]:
+    """Load every required opponent snapshot, failing loudly after drive-blink retries."""
+    opponents: List[Agent] = []
+    problems: List[str] = []
+
+    for opp_name in opponent_lists.get(name, []):
+        for s in TRAINING_SNAPSHOT_INDICES:
+            path = os.path.join(base_dir, f"{opp_name}_{s}.pkl")
+            if not _path_exists_respecting_transient_storage(path):
+                problems.append(f"missing {opp_name}_{s} at {path!r}")
+                continue
+
+            champ = load_champion(path)
+            if champ is None:
+                plist = load_parents(path)
+                if plist:
+                    champ = plist[0]
+
+            if champ is None:
+                problems.append(f"unloadable {opp_name}_{s} at {path!r}")
+                continue
+
+            opponents.append(champ)
+
+    expected = len(opponent_lists.get(name, [])) * len(TRAINING_SNAPSHOT_INDICES)
+    if problems or len(opponents) != expected:
+        detail = "; ".join(problems[:12])
+        if len(problems) > 12:
+            detail += f"; ... +{len(problems) - 12} more"
+        raise RuntimeError(
+            f"[{name}] {context}: expected {expected} opponent snapshots, "
+            f"loaded {len(opponents)}. {detail}"
+        )
+
+    return opponents
+
+
 def train_single_agent(
     name: str,
     opponent_lists: Dict[str, List[str]],
@@ -3040,7 +3932,7 @@ def train_single_agent(
     This is a per-agent wrapper around the old run_training_cycle
     per-agent block. It:
       * resumes GA from a saved population if available,
-      * otherwise seeds from existing parents or Xavier,
+      * otherwise seeds from existing canonical parents,
       * trains until a parent set passes,
       * saves parents to Name_0.pkl,
       * resets GA progress for this agent,
@@ -3062,7 +3954,7 @@ def train_single_agent(
         # Only trust the marker if the parents snapshot still exists.
         pop_path = os.path.join(base_dir, f"{name}_0.pkl")
         parents_existing = load_parents(pop_path)
-        if parents_existing:
+        if len(parents_existing) == PARENT_COUNT:
             last_gen = int(done_state.get("last_gen", 0) or 0)
             log(
                 f"[{name}] cycle {cycle}: GA already marked done at generation {last_gen}; "
@@ -3096,7 +3988,7 @@ def train_single_agent(
         )
     else:
         # No population snapshot: seed new GA population from parents in `_0` or `_1`,
-        # or from fresh Xavier seeds if neither exists.
+        # and refuses to invent fresh parents inside an initialized run.
         parent_path0 = os.path.join(base_dir, f"{name}_0.pkl")
         parent_path1 = os.path.join(base_dir, f"{name}_1.pkl")
 
@@ -3110,52 +4002,27 @@ def train_single_agent(
             log(f"[{name}] cycle {cycle}: seeding from existing parents in {source_path}.")
             population = build_population_from_parents(name, seed_parents, rnd)
         else:
-            # True "generation 0": 4 Xavier seeds as elites, plus 4 straight copies as other parents.
-            log(
-                f"[{name}] cycle {cycle}: no prior parents, creating fresh Xavier seed parents "
-                f"(4 elites + 4 copies)."
+            raise RuntimeError(
+                f"[{name}] cycle {cycle}: no saved population and no loadable canonical parent snapshot "
+                f"at {parent_path0!r} or {parent_path1!r}. Refusing to create fresh Xavier parents "
+                "inside an initialized run."
             )
-            seeds: List[Agent] = []
-            for _ in range(4):
-                net_seed = int(rnd.randint(0, 2**31 - 1))
-                a = Agent(
-                    name=name,
-                    net=MLP(input_dim=594, hidden_dim=512, seed=net_seed),
-                    trainable=True,
-                )
-                seeds.append(a)
-
-            parents_seed: List[Agent] = []
-            parents_seed.extend(seeds)
-            parents_seed.extend([s.clone() for s in seeds])
-
-            population = build_population_from_parents(name, parents_seed, rnd)
 
         # Newly seeded population is "generation 0" baseline.
         gen_start = 0
         save_population_state(name, population, gen_start, base_dir)
 
-    # Build opponent snapshots for this cycle (read-only; safe in parallel)
-    opponents: List[Agent] = []
-    for opp_name in opponent_lists.get(name, []):
-        for s in SNAPSHOT_INDICES:
-            path = os.path.join(base_dir, f"{opp_name}_{s}.pkl")
-            if os.path.exists(path):
-                champ = load_champion(path)
-                if champ is None:
-                    plist = load_parents(path)
-                    if plist:
-                        champ = plist[0]
-                    else:
-                        continue
-                opponents.append(champ)
+    # Build opponent snapshots for this cycle (read-only; safe in parallel).
+    # Partial loading is fatal: otherwise the GA success gate can be silently
+    # weakened by missing/corrupt snapshots.  Existence checks use the same
+    # drive-blink retry path as other I/O before declaring a file missing.
+    opponents = _load_required_opponent_snapshot_champions(
+        name=name,
+        opponent_lists=opponent_lists,
+        base_dir=base_dir,
+        context=f"cycle {cycle}",
+    )
     log(f"[{name}] cycle {cycle}: loaded {len(opponents)} opponent snapshots.")
-    # If the spec says we should have opponents but none loaded, treat as fatal.
-    if opponent_lists.get(name) and len(opponents) == 0:
-        raise RuntimeError(
-            f"[{name}] cycle {cycle}: expected opponent snapshots but loaded none. "
-            f"Check that {base_dir} contains <Opp>_1.pkl/.../<Opp>_4.pkl for listed opponents."
-        )
 
     # Train population until success
     gen = gen_start
@@ -3167,8 +4034,12 @@ def train_single_agent(
         check_stop(stop_event)
         gen += 1
         CURRENT_GEN = gen
-        # Use worst-case-only fitness every 1024 unsuccessful generations
-        use_worst = unsuccessful > 0 and unsuccessful % 1024 == 0
+        # Optional periodic fallback to worst-case-only fitness.
+        use_worst = (
+            WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS > 0
+            and unsuccessful > 0
+            and unsuccessful % WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS == 0
+        )
         population, parents, success = train_population_once(
             population,
             opponents,
@@ -3194,14 +4065,16 @@ def train_single_agent(
 
     # At success: prune `_0` down to the 8 selected parents for this cycle.
     pop_path = os.path.join(base_dir, f"{name}_0.pkl")
-    save_parents(parents, pop_path)
-    log(f"[{name}] cycle {cycle}: parents saved to {pop_path}")
+    save_parents_verified(parents, pop_path, label=f"{name}_0 cycle {cycle} parents")
+    log(f"[{name}] cycle {cycle}: parents saved and verified to {pop_path}")
 
-    # Clear GA progress for this agent now that the generation is complete
-    reset_ga_progress()
-
-    # Mark GA as done for this agent and cycle so future resumes can skip GA.
+    # Mark GA as done for this agent and cycle before clearing per-game GA
+    # progress. If a crash lands in this narrow window, resume can trust the
+    # verified Name_0.pkl parent list and skip needless retraining.
     save_ga_done_state(base_dir, name, cycle, gen)
+
+    # Clear GA progress for this agent now that the generation is complete.
+    reset_ga_progress()
 
     return gen
 
@@ -3234,6 +4107,9 @@ def train_group_agent_sequence(
     """
     # Redirect status + logging to the main process before any output.
     init_ipc(status_queue, log_queue)
+    if stop_event is not None:
+        _set_active_stop_event(stop_event)
+    _seed_process_move_randomness(f"train_group:{cycle}:{','.join(group_names)}")
 
     # Single environment reused for champion matches in this process
     env = BattledanceEnvironment()
@@ -3253,15 +4129,14 @@ def train_group_agent_sequence(
             # Load parents (8 nets) from Name_0.pkl for champion matches
             pop_path = os.path.join(base_dir, f"{name}_0.pkl")
             parents = load_parents(pop_path)
-            if not parents:
-                log(
-                    f"[{name}] cycle {cycle}: WARNING: parents missing after GA success; "
-                    f"skipping champion matches for this agent.",
+            if len(parents) != PARENT_COUNT:
+                raise RuntimeError(
+                    f"[{name}] cycle {cycle}: expected {PARENT_COUNT} loadable parents after GA success at {pop_path!r}; "
+                    f"loaded {len(parents)}. Refusing to mark agent done without champion matches."
                 )
-                continue
     
             # Per-agent champion match log
-            champ_log_path = _migrate_legacy_sample_game_if_needed(base_dir, f"champion_matches_{name}.txt")
+            champ_log_path = _sample_game_path(base_dir, f"champion_matches_{name}.txt")
     
             # Run champion matches immediately after training this agent
             run_champion_matches(
@@ -3285,6 +4160,35 @@ def train_group_agent_sequence(
 #  Main training loop and rotation
 ###############################################################################
 
+
+def _find_done_agents_with_invalid_outputs(
+    agent_names: Sequence[str],
+    agents_progress: Dict[str, Dict[str, object]],
+    base_dir: str,
+    cycle: int,
+    opponent_lists: Dict[str, List[str]],
+) -> Dict[str, str]:
+    """Return done agents whose parent snapshot or champion audit log is invalid."""
+    invalid: Dict[str, str] = {}
+    for name in agent_names:
+        sname = str(name)
+        entry = agents_progress.get(sname, {})
+        if entry.get("state") != "done":
+            continue
+        path = os.path.join(base_dir, f"{sname}_0.pkl")
+        if len(load_parents(path)) != PARENT_COUNT:
+            invalid[sname] = "done_state_but_missing_or_wrong_parent_count"
+            continue
+        if not _champion_match_log_complete_for_agent(
+            base_dir=base_dir,
+            cycle=cycle,
+            name=sname,
+            opponent_lists=opponent_lists,
+        ):
+            invalid[sname] = "done_state_but_missing_or_incomplete_champion_log"
+            continue
+    return invalid
+
 def run_training_cycle(
     agent_names: List[str],
     opponent_lists: Dict[str, List[str]],
@@ -3292,6 +4196,7 @@ def run_training_cycle(
     rnd: np.random.RandomState,
     cycle: int,
     thread_mode: str = "3",
+    thread_groups_override: Optional[List[List[str]]] = None,
 ) -> bool:
     """
     Run one training cycle across all agents.
@@ -3343,31 +4248,24 @@ def run_training_cycle(
     # immediately after that agent's GA training.
     # ------------------------------------------------------------------
 
-    # Define the fixed group layouts.
-    if thread_mode == "3":
-        thread_groups: List[List[str]] = [
-            ["deR", "Red", "Mag", "ulB", "Blu"],           # A
-            ["nyC", "Cyn", "gaM", "leY", "Yel"],           # B
-            ["ZyX", "XyZ", "nrG", "Grn", "NoN"],           # C
-        ]
-    elif thread_mode == "5":
-        thread_groups = [
-            ["Red", "Grn", "Blu"],                         # A
-            ["Cyn", "Mag", "Yel"],                         # B
-            ["ZyX", "XyZ", "NoN"],                         # C
-            ["deR", "nrG", "ulB"],                         # D
-            ["nyC", "gaM", "leY"],                         # E
-        ]
-    elif thread_mode == "1":
-        thread_groups = [
-            [
-                "ZyX", "nyC", "deR", "Cyn", "Red",
-                "XyZ", "gaM", "nrG", "Mag", "Grn",
-                "leY", "ulB", "NoN", "Yel", "Blu",
-            ],
-        ]
+    # Define worker groups.  Config-supplied named modes are resolved in main();
+    # if absent here, numeric strings split the configured agent list in order.
+    if thread_groups_override is not None:
+        thread_groups = [list(g) for g in thread_groups_override]
     else:
-        raise ValueError(f"Unsupported thread_mode {thread_mode!r}; expected '1', '3', or '5'.")
+        if str(thread_mode).isdigit():
+            n_workers = max(1, int(str(thread_mode)))
+            n_workers = min(n_workers, len(agent_names))
+            base = len(agent_names) // n_workers
+            rem = len(agent_names) % n_workers
+            thread_groups = []
+            start_idx = 0
+            for idx in range(n_workers):
+                size = base + (1 if idx < rem else 0)
+                thread_groups.append(agent_names[start_idx:start_idx + size])
+                start_idx += size
+        else:
+            raise ValueError(f"Unsupported thread_mode {thread_mode!r}; pass thread_groups_override for named modes.")
 
     # Determine which agents need GA+champ training in this cycle.
     # Anything not marked 'done' is treated as needing work.
@@ -3378,14 +4276,40 @@ def run_training_cycle(
         if state != "done":
             agents_to_train.append(name)
 
-    # Nothing to do for this cycle; all agents already marked done.
+    # Hardened resume validation: a "done" cycle-progress entry is only
+    # trusted if the corresponding Name_0.pkl parent snapshot still reloads.
+    # Otherwise the agent is put back into pending state and retrained instead
+    # of letting rotation fail later from a missing/corrupt _0 file.
+    invalid_done_agents = _find_done_agents_with_invalid_outputs(
+        agent_names,
+        agents_progress,
+        base_dir,
+        cycle,
+        opponent_lists,
+    )
+    if invalid_done_agents:
+        for bad_name, reason in invalid_done_agents.items():
+            entry = agents_progress.get(bad_name, {"state": "pending"})
+            entry["state"] = "pending"
+            entry["repair_reason"] = reason
+            agents_progress[bad_name] = entry
+            if bad_name not in agents_to_train:
+                agents_to_train.append(bad_name)
+        progress["agents"] = agents_progress
+        save_cycle_progress(base_dir, progress)
+        log(
+            f"[global] cycle {cycle}: re-opening done agent(s) with invalid done outputs: "
+            + ", ".join(f"{name}({reason})" for name, reason in invalid_done_agents.items())
+        )
+
+    # Nothing to do for this cycle; all agents already marked done and verified.
     if not agents_to_train:
-        log(f"[global] cycle {cycle}: all agents already marked done; skipping training.")
+        log(f"[global] cycle {cycle}: all agents already marked done and verified; skipping training.")
         return True
 
     # Build a seed per agent to keep randomness per-agent stable-ish.
     name_to_seed: Dict[str, int] = {
-        name: int(rnd.randint(0, 2**31 - 1)) for name in agents_to_train
+        name: _unique_net_seed(None, set()) for name in agents_to_train
     }
 
     # Build per-group lists that only include agents that actually need training.
@@ -3488,8 +4412,7 @@ def run_training_cycle(
                 # File I/O always happens here (single writer).
                 if LOG_PATH is not None:
                     try:
-                        with open(LOG_PATH, "a", encoding="utf-8") as f:
-                            f.write(line + "\n")
+                        _append_text_with_retry(LOG_PATH, line + "\n", durable=False)
                     except Exception:
                         pass
 
@@ -3662,12 +4585,12 @@ def _snapshot_paths_for_agent(base_dir: str, name: str) -> Dict[int, str]:
 
 def _load_required_rotation_parents(path: str, *, name: str, snap: int) -> List[Agent]:
     parents = load_parents(path)
-    if not parents:
+    if len(parents) != PARENT_COUNT:
         raise RotationError(
-            f"[{name}] rotation aborted: could not load usable parent list from _{snap} at {path!r}."
+            f"[{name}] rotation aborted: _{snap} at {path!r} must reload as exactly {PARENT_COUNT} parents; "
+            f"loaded {len(parents)}."
         )
     return parents
-
 
 def _load_required_rotation_champion(path: str, *, name: str, snap: int) -> Agent:
     champ = load_champion(path)
@@ -3762,12 +4685,20 @@ def _build_rotation_agent_plan(
         "4": _serialise_champion_payload(champ_3) if champ_3 is not None else None,
     }
 
+    fingerprints = {
+        "1": _parents_payload_fingerprint(payloads["1"]),
+        "2": _champion_payload_fingerprint(payloads["2"]),
+        "3": _champion_payload_fingerprint(payloads["3"]),
+        "4": _champion_payload_fingerprint(payloads["4"]),
+    }
+
     return {
         "kind": "cycle_rotation_agent_plan",
         "cycle": int(cycle),
         "agent": str(name),
         "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
         "payloads": payloads,
+        "fingerprints": fingerprints,
         "timestamp_created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
 
@@ -3842,34 +4773,45 @@ def _verify_rotation_agent_destinations(
     if not isinstance(payloads, dict):
         raise RotationError(f"[{name}] rotation plan has no payloads for verification.")
 
-    # _1 must reload as a parent list of the planned length.
+    fingerprints = plan.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        fingerprints = {}
+
+    # _1 must reload as the exact planned parent list, not merely any list.
     p1 = payloads.get("1")
+    expected_p1_fp = fingerprints.get("1") or _parents_payload_fingerprint(p1)
     parents_1 = load_parents(paths[1])
     if not isinstance(p1, list) or len(parents_1) != len(p1) or not parents_1:
         raise RotationError(
             f"[{name}] rotation verification failed: _1 at {paths[1]!r} did not reload as the planned parent list."
         )
-
-    # _2 must reload as a champion.
-    if load_champion(paths[2]) is None:
+    if expected_p1_fp is None or _parents_fingerprint(parents_1) != expected_p1_fp:
         raise RotationError(
-            f"[{name}] rotation verification failed: _2 at {paths[2]!r} did not reload as a champion."
+            f"[{name}] rotation verification failed: _1 at {paths[1]!r} reloaded, but parent fingerprint differs from plan."
         )
 
-    # _3/_4 reload if planned, otherwise confirm absent.
-    for snap in (3, 4):
+    # _2/_3/_4 reload if planned, otherwise confirm absent.
+    for snap in (2, 3, 4):
         payload = payloads.get(str(snap))
+        expected_fp = fingerprints.get(str(snap)) or _champion_payload_fingerprint(payload)
         path = paths[snap]
+
         if payload is None:
             if _path_exists_respecting_transient_storage(path):
                 raise RotationError(
                     f"[{name}] rotation verification failed: _{snap} at {path!r} should be absent but still exists."
                 )
-        else:
-            if load_champion(path) is None:
-                raise RotationError(
-                    f"[{name}] rotation verification failed: _{snap} at {path!r} did not reload as a champion."
-                )
+            continue
+
+        champ = load_champion(path)
+        if champ is None:
+            raise RotationError(
+                f"[{name}] rotation verification failed: _{snap} at {path!r} did not reload as a champion."
+            )
+        if expected_fp is None or _champion_agent_fingerprint(champ) != expected_fp:
+            raise RotationError(
+                f"[{name}] rotation verification failed: _{snap} at {path!r} reloaded, but champion fingerprint differs from plan."
+            )
 
 
 def _cleanup_cycle_rotation_plans(base_dir: str, cycle: int, agent_names: Sequence[str]) -> None:
@@ -4035,16 +4977,23 @@ def update_cycle_counter(base_dir: str) -> int:
     state_path = os.path.join(base_dir, "training_state.json")
     data = _safe_read_json(state_path)
     if not isinstance(data, dict):
-        data = {"cycle": 0}
+        raise RuntimeError(
+            f"Cannot advance cycle counter: training_state.json is missing, unreadable, or corrupt at {state_path!r}."
+        )
 
-    data["cycle"] = int(data.get("cycle", 0) or 0) + 1
+    old_cycle = int(data.get("cycle", 0) or 0)
+    new_cycle = old_cycle + 1
+    data["cycle"] = new_cycle
 
-    try:
-        _safe_write_json(state_path, data, indent=2, durable=True)
-    except Exception:
-        pass
+    _safe_write_json(state_path, data, indent=2, durable=True)
 
-    return int(data["cycle"])
+    reread = _safe_read_json(state_path)
+    if not isinstance(reread, dict) or int(reread.get("cycle", -1) or -1) != new_cycle:
+        raise RuntimeError(
+            f"Cycle counter write verification failed at {state_path!r}: expected cycle {new_cycle}."
+        )
+
+    return int(new_cycle)
 
 
 ###############################################################################
@@ -4072,8 +5021,7 @@ def _cycle_champions_rr_worker_progress_path(base_dir: str, cycle: int, worker_i
 
 def _cycle_champions_rr_worker_log_path(base_dir: str, cycle: int, worker_id: int) -> str:
     filename = f"cycle_{int(cycle)}_champions_rr_worker_{int(worker_id):02d}.txt"
-    return _migrate_legacy_sample_game_if_needed(base_dir, filename)
-
+    return _sample_game_path(base_dir, filename)
 
 def _cycle_champions_rr_moves_path(base_dir: str, cycle: int) -> str:
     return _sample_game_path(base_dir, f"cycle_{int(cycle)}_champions_rr.txt")
@@ -4083,20 +5031,44 @@ def _cycle_champions_rr_matrix_path(base_dir: str, cycle: int) -> str:
     return _sample_game_path(base_dir, f"cycle_{int(cycle)}_matrix.txt")
 
 
-def _is_cycle_rotation_done(base_dir: str, cycle: int) -> bool:
+def _rotation_done_snapshots_valid(agent_names: Sequence[str], base_dir: str) -> bool:
+    for name in agent_names:
+        p1 = os.path.join(base_dir, f"{name}_1.pkl")
+        if len(load_parents(p1)) != PARENT_COUNT:
+            return False
+        for snap in SNAPSHOT_INDICES:
+            if int(snap) == 1:
+                continue
+            path = os.path.join(base_dir, f"{name}_{int(snap)}.pkl")
+            if load_champion(path) is None:
+                return False
+    return True
+
+
+def _is_cycle_rotation_done(base_dir: str, cycle: int, agent_names: Optional[Sequence[str]] = None) -> bool:
+    if agent_names is None:
+        return False
     data = _safe_read_json(_cycle_rotation_done_path(base_dir, cycle))
-    return isinstance(data, dict) and data.get("cycle") == int(cycle) and bool(data.get("done"))
+    return (
+        isinstance(data, dict)
+        and data.get("kind") == "cycle_rotation_done"
+        and data.get("cycle") == int(cycle)
+        and bool(data.get("done"))
+        and data.get("agent_names_sha1") == _cycle_rr_names_sha1(agent_names)
+        and _rotation_done_snapshots_valid(agent_names, base_dir)
+    )
 
-
-def _mark_cycle_rotation_done(base_dir: str, cycle: int) -> None:
+def _mark_cycle_rotation_done(base_dir: str, cycle: int, agent_names: Optional[Sequence[str]] = None) -> None:
+    if agent_names is None:
+        raise ValueError("agent_names are required for rotation done marker strictness.")
     payload = {
         "kind": "cycle_rotation_done",
         "cycle": int(cycle),
         "done": True,
+        "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
     _safe_write_json(_cycle_rotation_done_path(base_dir, cycle), payload, indent=2, durable=True)
-
 
 def _make_cycle_rr_chunks(worker_count: int, row_count: int) -> List[Tuple[int, int]]:
     worker_count = int(worker_count)
@@ -4140,6 +5112,8 @@ def _empty_cycle_rr_worker_progress(
     agent_names: Sequence[str],
 ) -> Dict[str, object]:
     n = len(agent_names)
+    total_games = int(reps) * (int(row_end) - int(row_start)) * n
+    now_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     return {
         "kind": "cycle_champions_rr_worker_progress",
         "cycle": int(cycle),
@@ -4149,11 +5123,136 @@ def _empty_cycle_rr_worker_progress(
         "reps": int(reps),
         "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
         "game_index": 0,
-        "total_games": int(reps) * (int(row_end) - int(row_start)) * n,
+        "total_games": total_games,
         "done": False,
         "matrix": [[0 for _ in range(n)] for _ in range(n)],
-        "timestamp_updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "timestamp_started": now_s,
+        "timestamp_updated": now_s,
+        "games_total": total_games,
+        "games_played": 0,
+        "games_remaining": total_games,
+        "active_elapsed_seconds": 0.0,
+        "seconds_per_game_active": None,
+        "games_per_hour_active": None,
+        "eta_seconds_remaining": None,
+        "eta_stage_finish": None,
     }
+
+
+# Per-process timing state for post-rotation champion round-robin ETA metadata.
+# Like GA timing, this only counts active runtime after the current process
+# starts/resumes, so stopped-time between runs is not counted as active time.
+_CYCLE_RR_PROGRESS_TIMING_RUNTIME: Dict[Tuple[int, int], Dict[str, object]] = {}
+
+
+def _cycle_rr_progress_runtime_key(progress: Dict[str, object]) -> Tuple[int, int]:
+    return (
+        int(progress.get("cycle", 0) or 0),
+        int(progress.get("worker_id", 0) or 0),
+    )
+
+
+def _seed_cycle_rr_progress_timing_runtime(progress: Dict[str, object]) -> None:
+    key = _cycle_rr_progress_runtime_key(progress)
+    if key in _CYCLE_RR_PROGRESS_TIMING_RUNTIME:
+        return
+    try:
+        game_index = int(progress.get("game_index", 0) or 0)
+    except Exception:
+        game_index = 0
+    _CYCLE_RR_PROGRESS_TIMING_RUNTIME[key] = {
+        "last_time": time.time(),
+        "last_game_index": game_index,
+    }
+
+
+def _refresh_cycle_rr_worker_progress_timing(progress: Dict[str, object]) -> None:
+    """Update active runtime, games/hour, and ETA fields for cycle RR progress."""
+    now = time.time()
+    now_s = _timestamp_from_epoch(now)
+    progress["timestamp_updated"] = now_s
+
+    try:
+        game_index = max(0, int(progress.get("game_index", 0) or 0))
+    except Exception:
+        game_index = 0
+
+    try:
+        total_games = max(0, int(progress.get("total_games", progress.get("games_total", 0)) or 0))
+    except Exception:
+        total_games = 0
+
+    games_remaining = max(0, int(total_games) - int(game_index))
+
+    if "timestamp_started" not in progress:
+        progress["timestamp_started"] = now_s
+
+    try:
+        active_elapsed = max(0.0, float(progress.get("active_elapsed_seconds", 0.0) or 0.0))
+    except Exception:
+        active_elapsed = 0.0
+
+    key = _cycle_rr_progress_runtime_key(progress)
+    runtime = _CYCLE_RR_PROGRESS_TIMING_RUNTIME.get(key)
+    if runtime is None:
+        runtime = {"last_time": now, "last_game_index": game_index}
+        _CYCLE_RR_PROGRESS_TIMING_RUNTIME[key] = runtime
+    else:
+        try:
+            last_time = float(runtime.get("last_time", now) or now)
+            last_game_index = int(runtime.get("last_game_index", game_index) or 0)
+        except Exception:
+            last_time = now
+            last_game_index = game_index
+
+        if game_index > last_game_index:
+            active_elapsed += max(0.0, now - last_time)
+
+        runtime["last_time"] = now
+        runtime["last_game_index"] = game_index
+
+    progress["total_games"] = int(total_games)
+    progress["games_total"] = int(total_games)
+    progress["games_played"] = int(game_index)
+    progress["games_remaining"] = int(games_remaining)
+    progress["active_elapsed_seconds"] = round(float(active_elapsed), 3)
+
+    if total_games > 0 and game_index >= total_games:
+        progress["eta_seconds_remaining"] = 0.0
+        progress["eta_stage_finish"] = now_s
+        if game_index > 0 and active_elapsed > 0.0:
+            seconds_per_game = active_elapsed / float(game_index)
+            progress["seconds_per_game_active"] = round(seconds_per_game, 6)
+            progress["games_per_hour_active"] = round(3600.0 / seconds_per_game, 3) if seconds_per_game > 0 else None
+    elif game_index > 0 and active_elapsed > 0.0:
+        seconds_per_game = active_elapsed / float(game_index)
+        eta_seconds = seconds_per_game * float(games_remaining)
+        progress["seconds_per_game_active"] = round(seconds_per_game, 6)
+        progress["games_per_hour_active"] = round(3600.0 / seconds_per_game, 3) if seconds_per_game > 0 else None
+        progress["eta_seconds_remaining"] = round(eta_seconds, 3)
+        progress["eta_stage_finish"] = _timestamp_from_epoch(now + eta_seconds)
+    else:
+        progress["seconds_per_game_active"] = None
+        progress["games_per_hour_active"] = None
+        progress["eta_seconds_remaining"] = None
+        progress["eta_stage_finish"] = None
+
+
+def _cycle_rr_eta_status_suffix(progress: Optional[Dict[str, object]]) -> str:
+    if not isinstance(progress, dict):
+        return " | ETA --"
+
+    finish = progress.get("eta_stage_finish")
+    remaining = progress.get("eta_seconds_remaining")
+    if finish is None or remaining is None:
+        return " | ETA --"
+
+    try:
+        remaining_f = float(remaining)
+    except Exception:
+        return " | ETA --"
+
+    return f" | ETA {_format_eta_duration(remaining_f)} ({finish})"
 
 
 def _valid_cycle_rr_worker_progress(
@@ -4208,7 +5307,9 @@ def _load_cycle_rr_worker_progress(
         reps=reps,
         agent_names=agent_names,
     ):
-        return data  # type: ignore[return-value]
+        progress = data  # type: ignore[assignment]
+        _seed_cycle_rr_progress_timing_runtime(progress)
+        return progress  # type: ignore[return-value]
 
     progress = _empty_cycle_rr_worker_progress(
         cycle=cycle,
@@ -4219,6 +5320,7 @@ def _load_cycle_rr_worker_progress(
         agent_names=agent_names,
     )
     _safe_write_json(path, progress, indent=2, durable=True)
+    _seed_cycle_rr_progress_timing_runtime(progress)
     return progress
 
 
@@ -4230,13 +5332,17 @@ def _save_cycle_rr_worker_progress(
     progress: Dict[str, object],
     durable: bool = False,
 ) -> None:
-    progress["timestamp_updated"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    _safe_write_json(
-        _cycle_champions_rr_worker_progress_path(base_dir, cycle, worker_id),
-        progress,
-        indent=2,
-        durable=durable,
-    )
+    _refresh_cycle_rr_worker_progress_timing(progress)
+    path = _cycle_champions_rr_worker_progress_path(base_dir, cycle, worker_id)
+    try:
+        _safe_write_json(
+            path,
+            progress,
+            indent=2,
+            durable=durable,
+        )
+    except Exception as e:
+        _raise_checkpoint_write_failure("write cycle RR worker progress", path, e)
 
 
 def _cycle_rr_local_index_to_game(
@@ -4260,10 +5366,144 @@ def _cycle_rr_global_index(rep: int, white_idx: int, black_idx: int, n_agents: i
     return int(rep) * int(n_agents) * int(n_agents) + int(white_idx) * int(n_agents) + int(black_idx)
 
 
+def _cycle_rr_global_index_to_game(global_index: int, n_agents: int) -> Tuple[int, int, int]:
+    n = int(n_agents)
+    idx = int(global_index)
+    rep = idx // (n * n)
+    rem = idx % (n * n)
+    white_idx = rem // n
+    black_idx = rem % n
+    return rep, white_idx, black_idx
+
+
+def _cycle_rr_parse_log_result(header: str) -> int:
+    parts = str(header).split()
+    for i, token in enumerate(parts):
+        if token == "Result:" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except Exception:
+                break
+    raise ValueError(f"Could not parse cycle RR result from header: {header!r}")
+
+
+def _cycle_rr_read_worker_log_records(path: str) -> List[Tuple[int, int, str, str]]:
+    """Return complete worker-log records as (global_index, result, header, moves)."""
+    lines: List[str] = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            lines = []
+
+    records: List[Tuple[int, int, str, str]] = []
+    i = 0
+    while i + 1 < len(lines):
+        header = lines[i]
+        if header.startswith("Cycle: ") and " Index: " in header:
+            try:
+                idx = _cycle_rr_parse_log_index(header)
+                result = _cycle_rr_parse_log_result(header)
+                records.append((idx, result, header, lines[i + 1]))
+            except Exception:
+                # Stop at the first malformed complete-looking record; the
+                # tail will be truncated and replayed.
+                break
+            i += 2
+        else:
+            # Ignore stray lines before/between valid records, but do not let
+            # them count as completed games.
+            i += 1
+    return records
+
+
+def _cycle_rr_reconcile_progress_with_worker_log(
+    *,
+    base_dir: str,
+    cycle: int,
+    worker_id: int,
+    row_start: int,
+    row_end: int,
+    reps: int,
+    agent_names: Sequence[str],
+    progress: Dict[str, object],
+    log_path: str,
+) -> Dict[str, object]:
+    """Make RR progress agree with the durable worker move log.
+
+    The worker text log is the user-visible/audit result.  If a crash or drive
+    blink ever leaves JSON progress claiming more games than the log contains,
+    resume from the longest valid logged prefix and rebuild the partial matrix
+    from that prefix.
+    """
+    n = len(agent_names)
+    total_games = int(progress.get("total_games", int(reps) * (int(row_end) - int(row_start)) * n) or 0)
+    records = _cycle_rr_read_worker_log_records(log_path)
+
+    kept: List[Tuple[int, int, str, str]] = []
+    rebuilt_matrix = [[0 for _ in range(n)] for _ in range(n)]
+
+    for local_index, (idx, result, header, moves) in enumerate(records):
+        if local_index >= total_games:
+            break
+        rep, white_idx, black_idx = _cycle_rr_local_index_to_game(
+            local_index,
+            row_start=row_start,
+            row_end=row_end,
+            reps=reps,
+            n_agents=n,
+        )
+        expected_idx = _cycle_rr_global_index(rep, white_idx, black_idx, n)
+        if idx != expected_idx:
+            break
+        if result not in (-1, 0, 1):
+            break
+        if not _cycle_rr_header_matches_schedule(
+            header,
+            cycle=cycle,
+            reps=reps,
+            agent_names=agent_names,
+        ):
+            break
+        rebuilt_matrix[white_idx][black_idx] += int(result)
+        kept.append((idx, result, header, moves))
+
+    # Drop any malformed/out-of-order tail so future appends resume at the exact
+    # next scheduled game.
+    trimmed_text = "".join(f"{header}\n{moves}\n" for _idx, _result, header, moves in kept)
+    _safe_write_text(log_path, trimmed_text, durable=True)
+
+    old_game_index = int(progress.get("game_index", 0) or 0)
+    old_done = bool(progress.get("done"))
+    old_matrix = progress.get("matrix")
+
+    progress["game_index"] = int(len(kept))
+    progress["matrix"] = rebuilt_matrix
+    progress["done"] = bool(len(kept) >= total_games)
+    progress["total_games"] = int(total_games)
+    progress["games_total"] = int(total_games)
+
+    changed = (
+        old_game_index != len(kept)
+        or old_done != bool(progress["done"])
+        or old_matrix != rebuilt_matrix
+    )
+    if changed:
+        _save_cycle_rr_worker_progress(
+            base_dir=base_dir,
+            cycle=cycle,
+            worker_id=worker_id,
+            progress=progress,
+            durable=True,
+        )
+    return progress
+
+
 def _cycle_rr_truncate_worker_log(path: str, keep_games: int) -> None:
     if keep_games <= 0:
         try:
-            open(path, "w", encoding="utf-8").close()
+            _safe_write_text(path, "", durable=True)
         except Exception:
             pass
         return
@@ -4292,9 +5532,7 @@ def _cycle_rr_truncate_worker_log(path: str, keep_games: int) -> None:
         trimmed.append(moves)
 
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            if trimmed:
-                f.write("\n".join(trimmed) + "\n")
+        _safe_write_text(path, ("\n".join(trimmed) + "\n") if trimmed else "", durable=True)
     except Exception:
         pass
 
@@ -4315,13 +5553,18 @@ def _cycle_rr_check_stop(
         is_set = False
     if not is_set:
         return
-    _save_cycle_rr_worker_progress(
-        base_dir=base_dir,
-        cycle=cycle,
-        worker_id=worker_id,
-        progress=progress,
-        durable=True,
-    )
+    # If the stop was requested because the storage root stayed missing past
+    # the retry window, do not immediately wait through the same failed durable
+    # checkpoint again. The last completed game is already represented by the
+    # durable move log / last successful JSON checkpoint.
+    if not _PERSISTENT_STORAGE_LOSS_DETECTED:
+        _save_cycle_rr_worker_progress(
+            base_dir=base_dir,
+            cycle=cycle,
+            worker_id=worker_id,
+            progress=progress,
+            durable=True,
+        )
     raise GracefulStop()
 
 
@@ -4364,6 +5607,9 @@ def _cycle_rr_worker_row_block(
     partial margin matrix after every game.
     """
     init_ipc(status_queue, log_queue)
+    if stop_event is not None:
+        _set_active_stop_event(stop_event)
+    _seed_process_move_randomness(f"cycle_rr:{cycle}:{worker_id}:{row_start}:{row_end}")
     progress: Dict[str, object] = {}
     try:
         env = BattledanceEnvironment()
@@ -4379,12 +5625,22 @@ def _cycle_rr_worker_row_block(
             reps=reps,
             agent_names=agent_names,
         )
+        log_path = _cycle_champions_rr_worker_log_path(base_dir, cycle, worker_id)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        progress = _cycle_rr_reconcile_progress_with_worker_log(
+            base_dir=base_dir,
+            cycle=cycle,
+            worker_id=worker_id,
+            row_start=row_start,
+            row_end=row_end,
+            reps=reps,
+            agent_names=agent_names,
+            progress=progress,
+            log_path=log_path,
+        )
         matrix = [[int(x) for x in row] for row in progress.get("matrix", [[0] * n for _ in range(n)])]
         local_games = int(progress.get("game_index", 0) or 0)
         total_games = int(progress.get("total_games", int(reps) * (int(row_end) - int(row_start)) * n) or 0)
-        log_path = _cycle_champions_rr_worker_log_path(base_dir, cycle, worker_id)
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        _cycle_rr_truncate_worker_log(log_path, local_games)
 
         if bool(progress.get("done")) and local_games >= total_games:
             log(f"[cycle {cycle} RR] worker {worker_id} white rows {row_start + 1}-{row_end} already done ({local_games}/{total_games}).")
@@ -4414,10 +5670,12 @@ def _cycle_rr_worker_row_block(
             status(
                 f"[cycle {cycle} RR W{worker_id}] game {local_games + 1}/{total_games} "
                 f"rep {rep + 1}/{reps} {white_name} vs {black_name}"
+                f"{_cycle_rr_eta_status_suffix(progress)}"
             )
 
-            # Make each scheduled game independent of prior resumed/skipped RNG state.
-            random.seed((int(cycle) + 1) * 1000003 + int(global_index))
+            # Intentionally do not seed per scheduled game here.  Repeated games
+            # should remain naturally stochastic rather than accidentally becoming
+            # identical wherever the same schedule shape recurs downstream.
             result, moves_str = play_game_with_moves(champions[white_idx], champions[black_idx], env)
             result = int(result)
 
@@ -4429,9 +5687,13 @@ def _cycle_rr_worker_row_block(
             )
             # The move log is part of the durable result of this pass.
             # Do not advance progress unless this append succeeds.
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(header + "\n")
-                f.write(moves_str + "\n")
+            try:
+                _append_text_with_retry(log_path, header + "\n" + moves_str + "\n", durable=True)
+            except Exception as e:
+                _request_stop_if_storage_root_still_missing("append cycle RR worker log", log_path, e)
+                if _PERSISTENT_STORAGE_LOSS_DETECTED:
+                    raise GracefulStop()
+                raise
 
             local_games += 1
             progress["game_index"] = int(local_games)
@@ -4515,6 +5777,17 @@ def _cycle_rr_aggregate_worker_progress(
             reps=reps,
             agent_names=agent_names,
         )
+        progress = _cycle_rr_reconcile_progress_with_worker_log(
+            base_dir=base_dir,
+            cycle=cycle,
+            worker_id=worker_id,
+            row_start=a,
+            row_end=b,
+            reps=reps,
+            agent_names=agent_names,
+            progress=progress,
+            log_path=_cycle_champions_rr_worker_log_path(base_dir, cycle, worker_id),
+        )
         total_games += int(progress.get("game_index", 0) or 0)
         all_done = all_done and bool(progress.get("done"))
         part = progress.get("matrix", [[0] * n for _ in range(n)])
@@ -4535,6 +5808,151 @@ def _cycle_rr_parse_log_index(header: str) -> int:
                 return 10**18
     return 10**18
 
+
+
+def _cycle_rr_parse_header_fields(header: str) -> Optional[Dict[str, object]]:
+    if not isinstance(header, str) or not header.startswith("Cycle: "):
+        return None
+    parts = header.split()
+    fields: Dict[str, object] = {}
+    expected_keys = {"Cycle:", "Index:", "Rep:", "White:", "Black:", "Result:"}
+    i = 0
+    while i + 1 < len(parts):
+        key = parts[i]
+        val = parts[i + 1]
+        if key in expected_keys:
+            fields[key[:-1]] = val
+            i += 2
+        else:
+            i += 1
+    try:
+        parsed = {
+            "cycle": int(fields["Cycle"]),
+            "index": int(fields["Index"]),
+            "rep": int(fields["Rep"]),
+            "white": str(fields["White"]),
+            "black": str(fields["Black"]),
+            "result": int(fields["Result"]),
+        }
+    except Exception:
+        return None
+    if parsed["result"] not in (-1, 0, 1):
+        return None
+    return parsed
+
+
+def _cycle_rr_header_matches_schedule(
+    header: str,
+    *,
+    cycle: int,
+    reps: int,
+    agent_names: Sequence[str],
+) -> bool:
+    parsed = _cycle_rr_parse_header_fields(header)
+    if parsed is None:
+        return False
+    n = len(agent_names)
+    idx = int(parsed["index"])
+    expected_games = int(reps) * n * n
+    if idx < 0 or idx >= expected_games:
+        return False
+    rep, white_idx, black_idx = _cycle_rr_global_index_to_game(idx, n)
+    return (
+        parsed.get("cycle") == int(cycle)
+        and parsed.get("rep") == int(rep) + 1
+        and parsed.get("white") == str(agent_names[white_idx])
+        and parsed.get("black") == str(agent_names[black_idx])
+        and parsed.get("result") in (-1, 0, 1)
+    )
+
+
+def _cycle_rr_matrix_text(
+    *,
+    cycle: int,
+    reps: int,
+    agent_names: Sequence[str],
+    matrix: Sequence[Sequence[int]],
+) -> str:
+    label_width = max(5, max(len(str(x)) for x in agent_names) + 1)
+    cell_width = 5
+    lines: List[str] = []
+    lines.append(f"Cycle {int(cycle)} newly minted _1 champion round-robin")
+    lines.append(f"Reps: {int(reps)}")
+    lines.append("Rows = White _1 champion; columns = Black _1 champion.")
+    lines.append("Cell = sum of game results from White's perspective.")
+    lines.append("")
+    lines.append(
+        "White\\Black".ljust(label_width + 6)
+        + "".join(str(name).rjust(cell_width) for name in agent_names)
+    )
+    for r in range(len(agent_names)):
+        lines.append(
+            str(agent_names[r]).ljust(label_width + 6)
+            + "".join(f"{int(matrix[r][c]):+{cell_width}d}" for c in range(len(agent_names)))
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _cycle_rr_final_outputs_valid(
+    *,
+    base_dir: str,
+    cycle: int,
+    reps: int,
+    agent_names: Sequence[str],
+) -> bool:
+    done = _safe_read_json(_cycle_champions_rr_done_path(base_dir, cycle))
+    expected_games = int(reps) * len(agent_names) * len(agent_names)
+    if not (
+        isinstance(done, dict)
+        and done.get("kind") == "cycle_champions_rr_done"
+        and done.get("cycle") == int(cycle)
+        and done.get("reps") == int(reps)
+        and done.get("games") == int(expected_games)
+        and done.get("agent_names_sha1") == _cycle_rr_names_sha1(agent_names)
+    ):
+        return False
+
+    moves_path = _cycle_champions_rr_moves_path(base_dir, cycle)
+    matrix_path = _cycle_champions_rr_matrix_path(base_dir, cycle)
+    if not os.path.exists(moves_path) or not os.path.exists(matrix_path):
+        return False
+
+    try:
+        with open(moves_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return False
+
+    n = len(agent_names)
+    records: List[Tuple[int, int, str, str]] = []
+    i = 0
+    while i + 1 < len(lines):
+        header = lines[i]
+        moves = lines[i + 1]
+        parsed = _cycle_rr_parse_header_fields(header)
+        if parsed is None:
+            return False
+        records.append((int(parsed["index"]), int(parsed["result"]), header, moves))
+        i += 2
+    if len(records) != expected_games:
+        return False
+
+    records.sort(key=lambda x: x[0])
+    matrix_from_logs = [[0 for _ in range(n)] for _ in range(n)]
+    for expected_idx, (idx, result, header, _moves) in enumerate(records):
+        if idx != expected_idx:
+            return False
+        if not _cycle_rr_header_matches_schedule(header, cycle=cycle, reps=reps, agent_names=agent_names):
+            return False
+        _rep, white_idx, black_idx = _cycle_rr_global_index_to_game(idx, n)
+        matrix_from_logs[white_idx][black_idx] += int(result)
+
+    try:
+        with open(matrix_path, "r", encoding="utf-8") as f:
+            matrix_text = f.read()
+    except Exception:
+        return False
+    return matrix_text == _cycle_rr_matrix_text(cycle=cycle, reps=reps, agent_names=agent_names, matrix=matrix_from_logs)
 
 def _cycle_rr_finalize_outputs(
     *,
@@ -4559,7 +5977,10 @@ def _cycle_rr_finalize_outputs(
         while i + 1 < len(lines):
             header = lines[i]
             if header.startswith("Cycle: ") and " Index: " in header:
-                records.append((_cycle_rr_parse_log_index(header), header, lines[i + 1]))
+                parsed = _cycle_rr_parse_header_fields(header)
+                if parsed is None:
+                    break
+                records.append((int(parsed["index"]), header, lines[i + 1]))
                 i += 2
             else:
                 i += 1
@@ -4571,44 +5992,53 @@ def _cycle_rr_finalize_outputs(
             f"Cycle {cycle} RR expected {expected_games} logged games, found {len(records)}."
         )
 
+    n = len(agent_names)
+    matrix_from_logs = [[0 for _ in range(n)] for _ in range(n)]
+    for expected_idx, (idx, header, _moves) in enumerate(records):
+        if idx != expected_idx:
+            raise RuntimeError(
+                f"Cycle {cycle} RR logged game indices are not exactly 0..{expected_games - 1}; "
+                f"first mismatch got {idx}, expected {expected_idx}."
+            )
+        if not _cycle_rr_header_matches_schedule(header, cycle=cycle, reps=reps, agent_names=agent_names):
+            raise RuntimeError(f"Cycle {cycle} RR header does not match expected schedule at index {idx}: {header!r}")
+        result = _cycle_rr_parse_log_result(header)
+        _rep, white_idx, black_idx = _cycle_rr_global_index_to_game(idx, n)
+        matrix_from_logs[white_idx][black_idx] += int(result)
+
+    if matrix != matrix_from_logs:
+        log(
+            f"[cycle {cycle} RR] WARNING: progress matrix disagreed with logged games; "
+            f"final matrix rebuilt from move log.",
+            also_print=False,
+        )
+    matrix = matrix_from_logs
+
     moves_path = _cycle_champions_rr_moves_path(base_dir, cycle)
-    os.makedirs(os.path.dirname(moves_path), exist_ok=True)
-    with open(moves_path, "w", encoding="utf-8") as f:
-        for _, header, moves in records:
-            f.write(header + "\n")
-            f.write(moves + "\n")
+    moves_text = "".join(f"{header}\n{moves}\n" for _, header, moves in records)
+    _safe_write_text(moves_path, moves_text, durable=True)
 
     matrix_path = _cycle_champions_rr_matrix_path(base_dir, cycle)
-    n = len(agent_names)
-    label_width = max(5, max(len(str(x)) for x in agent_names) + 1)
-    cell_width = 5
-    with open(matrix_path, "w", encoding="utf-8") as f:
-        f.write(f"Cycle {int(cycle)} newly minted _1 champion round-robin\n")
-        f.write(f"Reps: {int(reps)}\n")
-        f.write("Rows = White _1 champion; columns = Black _1 champion.\n")
-        f.write("Cell = sum of game results from White's perspective.\n\n")
-        f.write("White\\Black".ljust(label_width + 6))
-        for name in agent_names:
-            f.write(str(name).rjust(cell_width))
-        f.write("\n")
-        for r in range(n):
-            f.write(str(agent_names[r]).ljust(label_width + 6))
-            for c in range(n):
-                f.write(f"{int(matrix[r][c]):+{cell_width}d}")
-            f.write("\n")
+    _safe_write_text(
+        matrix_path,
+        _cycle_rr_matrix_text(cycle=cycle, reps=reps, agent_names=agent_names, matrix=matrix),
+        durable=True,
+    )
 
     done_payload = {
         "kind": "cycle_champions_rr_done",
         "cycle": int(cycle),
         "reps": int(reps),
         "games": int(expected_games),
+        "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
         "moves_file": os.path.basename(moves_path),
         "matrix_file": os.path.basename(matrix_path),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
     _safe_write_json(_cycle_champions_rr_done_path(base_dir, cycle), done_payload, indent=2, durable=True)
+    if not _cycle_rr_final_outputs_valid(base_dir=base_dir, cycle=cycle, reps=reps, agent_names=agent_names):
+        raise RuntimeError(f"Cycle {cycle} RR final output verification failed after writing done marker.")
     log(f"[cycle {cycle} RR] finalized {expected_games} games to {os.path.basename(moves_path)} and {os.path.basename(matrix_path)}.")
-
 
 def run_cycle_champions_round_robin(
     agent_names: List[str],
@@ -4632,12 +6062,11 @@ def run_cycle_champions_round_robin(
       * cycle_n_champions_rr_worker_##.txt
       * cycle_n_champions_rr_done.json
     """
-    done = _safe_read_json(_cycle_champions_rr_done_path(base_dir, cycle))
-    if isinstance(done, dict) and done.get("cycle") == int(cycle) and done.get("kind") == "cycle_champions_rr_done":
-        log(f"[cycle {cycle} RR] already marked done; skipping post-rotation champion round-robin.")
+    reps = int(reps)
+    if _cycle_rr_final_outputs_valid(base_dir=base_dir, cycle=cycle, reps=reps, agent_names=agent_names):
+        log(f"[cycle {cycle} RR] already marked done and final outputs verified; skipping post-rotation champion round-robin.")
         return
 
-    reps = int(reps)
     if reps <= 0:
         raise ValueError("Cycle champion round-robin reps must be positive.")
 
@@ -4753,8 +6182,7 @@ def run_cycle_champions_round_robin(
                     break
                 if LOG_PATH is not None:
                     try:
-                        with open(LOG_PATH, "a", encoding="utf-8") as f:
-                            f.write(line + "\n")
+                        _append_text_with_retry(LOG_PATH, line + "\n", durable=False)
                     except Exception:
                         pass
                 if also_print:
@@ -4800,11 +6228,13 @@ def run_cycle_champions_round_robin(
             for p in processes:
                 p.start()
 
-            remaining = len(processes)
-            while remaining > 0:
-                item = result_queue.get()
-                results.append(item)
-                remaining -= 1
+            results = _collect_worker_results_or_raise(
+                processes=processes,
+                result_queue=result_queue,
+                expected_count=len(processes),
+                context=f"Cycle {cycle} RR",
+            )
+            for item in results:
                 wid = item.get("worker_id", "?")
                 a = int(item.get("row_start", 0))
                 b = int(item.get("row_end", 0))
@@ -4892,13 +6322,22 @@ def _clone_agent_as(agent: Agent, name: str, *, trainable: bool = False) -> Agen
     return Agent(name=name, net=agent.net.copy(), trainable=trainable)
 
 
-def _unique_net_seed(rnd: np.random.RandomState, used: set[int]) -> int:
-    """Draw a unique 31-bit seed from `rnd`."""
+def _unique_net_seed(rnd: Optional[np.random.RandomState], used: set[int]) -> int:
+    """Draw a unique 31-bit seed, preferring direct OS entropy."""
     while True:
-        seed = int(rnd.randint(0, 2**31 - 1))
+        try:
+            seed = int.from_bytes(os.urandom(4), "big") & ((1 << 31) - 1)
+        except Exception:
+            if rnd is None:
+                rnd = np.random.RandomState()
+            seed = int(rnd.randint(0, 2**31 - 1))
         if seed not in used:
             used.add(seed)
             return seed
+
+
+def _prelude_seed_count() -> int:
+    return max(1, len(PRELUDE_SNAKE_ORDER) * len(SNAPSHOT_INDICES))
 
 
 def _build_prelude_seed_agents(net_seeds: Sequence[int]) -> List[Agent]:
@@ -4908,7 +6347,7 @@ def _build_prelude_seed_agents(net_seeds: Sequence[int]) -> List[Agent]:
         agents.append(
             Agent(
                 name=f"prelude_seed_{idx + 1:02d}",
-                net=MLP(input_dim=594, hidden_dim=512, seed=int(net_seed)),
+                net=MLP(seed=int(net_seed)),
                 trainable=False,
             )
         )
@@ -4932,10 +6371,11 @@ def _make_prelude_chunks(workers: int) -> List[Tuple[int, int]]:
     workers = int(workers)
     if workers <= 0:
         workers = 1
-    workers = min(workers, 60)
+    seed_count = _prelude_seed_count()
+    workers = min(workers, seed_count)
 
-    base = 60 // workers
-    rem = 60 % workers
+    base = seed_count // workers
+    rem = seed_count % workers
     row_start = 0
     chunks: List[Tuple[int, int]] = []
     for w in range(workers):
@@ -4950,17 +6390,14 @@ def _new_prelude_master_state(
     *,
     base_dir: str,
     rounds: int,
-    seed: Optional[int],
     workers: int,
 ) -> Dict[str, object]:
-    rnd = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
-    if seed is not None:
-        random.seed(int(seed))
+    rnd = None
 
     used: set[int] = set()
     net_seeds: List[int] = []
     seed_records: List[Dict[str, object]] = []
-    for idx in range(60):
+    for idx in range(_prelude_seed_count()):
         net_seed = _unique_net_seed(rnd, used)
         net_seeds.append(net_seed)
         seed_records.append({
@@ -4975,16 +6412,15 @@ def _new_prelude_master_state(
         "state": "running",
         "rounds": int(rounds),
         "workers": int(workers),
-        "seed": seed,
         "net_seeds": net_seeds,
         "seed_records": seed_records,
         "chunks": [
             {"worker_id": idx + 1, "row_start": a, "row_end": b}
             for idx, (a, b) in enumerate(chunks)
         ],
-        "scheduled_games": int(rounds) * 60 * 60,
+        "scheduled_games": int(rounds) * _prelude_seed_count() * _prelude_seed_count(),
         "games_per_distinct_unordered_pair": 2 * int(rounds),
-        "self_intersections": 60 * int(rounds),
+        "self_intersections": _prelude_seed_count() * int(rounds),
         "timestamp_started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
         "timestamp_updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
@@ -4996,7 +6432,6 @@ def _load_or_create_prelude_master_state(
     *,
     base_dir: str,
     rounds: int,
-    seed: Optional[int],
     workers: int,
 ) -> Dict[str, object]:
     path = _prelude_master_progress_path(base_dir)
@@ -5006,11 +6441,10 @@ def _load_or_create_prelude_master_state(
             data.get("kind") == "prelude_progress"
             and data.get("rounds") == int(rounds)
             and data.get("workers") == int(workers)
-            and data.get("seed") == seed
             and isinstance(data.get("net_seeds"), list)
-            and len(data.get("net_seeds", [])) == 60
+            and len(data.get("net_seeds", [])) == _prelude_seed_count()
             and isinstance(data.get("seed_records"), list)
-            and len(data.get("seed_records", [])) == 60
+            and len(data.get("seed_records", [])) == _prelude_seed_count()
         )
         if ok:
             if data.get("state") == "done":
@@ -5019,7 +6453,123 @@ def _load_or_create_prelude_master_state(
                 log("[prelude] existing prelude_progress.json found; resuming prelude.")
             return data
 
-    return _new_prelude_master_state(base_dir=base_dir, rounds=rounds, seed=seed, workers=workers)
+    return _new_prelude_master_state(base_dir=base_dir, rounds=rounds, workers=workers)
+
+
+# Per-process timing state for prelude-worker ETA metadata.  Like GA timing,
+# this intentionally avoids counting stopped/resumed downtime as active work.
+_PRELUDE_PROGRESS_TIMING_RUNTIME: Dict[Tuple[int, int, int, int, str], Dict[str, object]] = {}
+
+
+def _prelude_progress_runtime_key(progress: Dict[str, object]) -> Tuple[int, int, int, int, str]:
+    return (
+        int(progress.get("worker_id", 0) or 0),
+        int(progress.get("row_start", 0) or 0),
+        int(progress.get("row_end", 0) or 0),
+        int(progress.get("rounds", 0) or 0),
+        str(progress.get("net_seeds_sha1", "") or ""),
+    )
+
+
+def _seed_prelude_progress_timing_runtime(progress: Dict[str, object]) -> None:
+    """Seed the in-memory timing marker when an existing prelude worker file is loaded."""
+    key = _prelude_progress_runtime_key(progress)
+    if key in _PRELUDE_PROGRESS_TIMING_RUNTIME:
+        return
+    try:
+        game_index = int(progress.get("game_index", 0) or 0)
+    except Exception:
+        game_index = 0
+    _PRELUDE_PROGRESS_TIMING_RUNTIME[key] = {
+        "last_time": time.time(),
+        "last_game_index": game_index,
+    }
+
+
+def _refresh_prelude_progress_timing(progress: Dict[str, object]) -> None:
+    """Add/update timing and ETA metadata in prelude worker progress."""
+    now = time.time()
+    now_s = _timestamp_from_epoch(now)
+    progress["timestamp_updated"] = now_s
+
+    try:
+        game_index = max(0, int(progress.get("game_index", 0) or 0))
+    except Exception:
+        game_index = 0
+
+    try:
+        total_games = max(0, int(progress.get("total_games", 0) or 0))
+    except Exception:
+        total_games = 0
+
+    games_remaining = max(0, int(total_games) - int(game_index))
+
+    if "timestamp_started" not in progress:
+        progress["timestamp_started"] = now_s
+
+    try:
+        active_elapsed = max(0.0, float(progress.get("active_elapsed_seconds", 0.0) or 0.0))
+    except Exception:
+        active_elapsed = 0.0
+
+    key = _prelude_progress_runtime_key(progress)
+    runtime = _PRELUDE_PROGRESS_TIMING_RUNTIME.get(key)
+    if runtime is None:
+        runtime = {"last_time": now, "last_game_index": game_index}
+        _PRELUDE_PROGRESS_TIMING_RUNTIME[key] = runtime
+    else:
+        try:
+            last_time = float(runtime.get("last_time", now) or now)
+            last_game_index = int(runtime.get("last_game_index", game_index) or 0)
+        except Exception:
+            last_time = now
+            last_game_index = game_index
+
+        if game_index > last_game_index:
+            active_elapsed += max(0.0, now - last_time)
+
+        runtime["last_time"] = now
+        runtime["last_game_index"] = game_index
+
+    progress["games_total"] = int(total_games)
+    progress["games_played"] = int(game_index)
+    progress["games_remaining"] = int(games_remaining)
+    progress["active_elapsed_seconds"] = round(float(active_elapsed), 3)
+
+    if total_games > 0 and game_index >= total_games:
+        progress["eta_seconds_remaining"] = 0.0
+        progress["eta_stage_finish"] = now_s
+        if game_index > 0 and active_elapsed > 0.0:
+            seconds_per_game = active_elapsed / float(game_index)
+            progress["seconds_per_game_active"] = round(seconds_per_game, 6)
+            progress["games_per_hour_active"] = round(3600.0 / seconds_per_game, 3) if seconds_per_game > 0 else None
+    elif game_index > 0 and active_elapsed > 0.0:
+        seconds_per_game = active_elapsed / float(game_index)
+        eta_seconds = seconds_per_game * float(games_remaining)
+        progress["seconds_per_game_active"] = round(seconds_per_game, 6)
+        progress["games_per_hour_active"] = round(3600.0 / seconds_per_game, 3) if seconds_per_game > 0 else None
+        progress["eta_seconds_remaining"] = round(eta_seconds, 3)
+        progress["eta_stage_finish"] = _timestamp_from_epoch(now + eta_seconds)
+    else:
+        progress["seconds_per_game_active"] = None
+        progress["games_per_hour_active"] = None
+        progress["eta_seconds_remaining"] = None
+        progress["eta_stage_finish"] = None
+
+
+def _prelude_eta_status_suffix(progress: Optional[Dict[str, object]]) -> str:
+    """Return a short console-only ETA suffix for a prelude worker."""
+    if not isinstance(progress, dict):
+        return " | ETA --"
+    finish = progress.get("eta_stage_finish")
+    remaining = progress.get("eta_seconds_remaining")
+    if finish is None or remaining is None:
+        return " | ETA --"
+    try:
+        remaining_f = float(remaining)
+    except Exception:
+        return " | ETA --"
+    return f" | ETA {_format_eta_duration(remaining_f)} ({finish})"
 
 
 def _empty_prelude_worker_progress(
@@ -5038,13 +6588,22 @@ def _empty_prelude_worker_progress(
         "rounds": int(rounds),
         "net_seeds_sha1": hashlib.sha1(json.dumps(list(map(int, net_seeds))).encode("utf-8")).hexdigest(),
         "game_index": 0,
-        "total_games": int(rounds) * (int(row_end) - int(row_start)) * 60,
+        "total_games": int(rounds) * (int(row_end) - int(row_start)) * _prelude_seed_count(),
         "done": False,
-        "scores": [0 for _ in range(60)],
-        "wins": [0 for _ in range(60)],
-        "draws": [0 for _ in range(60)],
-        "losses": [0 for _ in range(60)],
+        "scores": [0 for _ in range(_prelude_seed_count())],
+        "wins": [0 for _ in range(_prelude_seed_count())],
+        "draws": [0 for _ in range(_prelude_seed_count())],
+        "losses": [0 for _ in range(_prelude_seed_count())],
+        "timestamp_started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
         "timestamp_updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "games_total": int(rounds) * (int(row_end) - int(row_start)) * _prelude_seed_count(),
+        "games_played": 0,
+        "games_remaining": int(rounds) * (int(row_end) - int(row_start)) * _prelude_seed_count(),
+        "active_elapsed_seconds": 0.0,
+        "seconds_per_game_active": None,
+        "games_per_hour_active": None,
+        "eta_seconds_remaining": None,
+        "eta_stage_finish": None,
     }
 
 
@@ -5067,10 +6626,10 @@ def _valid_prelude_worker_progress(
         and data.get("row_end") == int(row_end)
         and data.get("rounds") == int(rounds)
         and data.get("net_seeds_sha1") == expected_hash
-        and isinstance(data.get("scores"), list) and len(data.get("scores", [])) == 60
-        and isinstance(data.get("wins"), list) and len(data.get("wins", [])) == 60
-        and isinstance(data.get("draws"), list) and len(data.get("draws", [])) == 60
-        and isinstance(data.get("losses"), list) and len(data.get("losses", [])) == 60
+        and isinstance(data.get("scores"), list) and len(data.get("scores", [])) == _prelude_seed_count()
+        and isinstance(data.get("wins"), list) and len(data.get("wins", [])) == _prelude_seed_count()
+        and isinstance(data.get("draws"), list) and len(data.get("draws", [])) == _prelude_seed_count()
+        and isinstance(data.get("losses"), list) and len(data.get("losses", [])) == _prelude_seed_count()
     )
 
 
@@ -5094,6 +6653,7 @@ def _load_prelude_worker_progress(
         rounds=rounds,
         net_seeds=net_seeds,
     ):
+        _seed_prelude_progress_timing_runtime(data)  # type: ignore[arg-type]
         return data  # type: ignore[return-value]
 
     progress = _empty_prelude_worker_progress(
@@ -5104,6 +6664,7 @@ def _load_prelude_worker_progress(
         net_seeds=net_seeds,
     )
     _safe_write_json(path, progress, indent=2, durable=True)
+    _seed_prelude_progress_timing_runtime(progress)
     return progress
 
 
@@ -5114,17 +6675,29 @@ def _prelude_local_index_to_game(
     row_end: int,
 ) -> Tuple[int, int, int]:
     rows = int(row_end) - int(row_start)
-    games_per_round = rows * 60
+    games_per_round = rows * _prelude_seed_count()
     r = int(local_index) // games_per_round
     rem = int(local_index) % games_per_round
-    i = int(row_start) + (rem // 60)
-    j = rem % 60
+    i = int(row_start) + (rem // _prelude_seed_count())
+    j = rem % _prelude_seed_count()
     return r, i, j
 
 
 def _prelude_save_worker_progress(base_dir: str, worker_id: int, progress: Dict[str, object], *, durable: bool = False) -> None:
-    progress["timestamp_updated"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    _safe_write_json(_prelude_worker_progress_path(base_dir, worker_id), progress, indent=2, durable=durable)
+    _refresh_prelude_progress_timing(progress)
+    path = _prelude_worker_progress_path(base_dir, worker_id)
+    try:
+        _safe_write_json(path, progress, indent=2, durable=durable)
+    except Exception as e:
+        _request_stop_if_storage_root_still_missing("write prelude worker progress", path, e)
+        active = _get_active_stop_event()
+        try:
+            active_is_set = bool(active is not None and active.is_set())
+        except Exception:
+            active_is_set = False
+        if _PERSISTENT_STORAGE_LOSS_DETECTED and active_is_set:
+            return
+        raise
 
 
 def _prelude_check_stop(stop_event, *, base_dir: str, worker_id: int, progress: Dict[str, object]) -> None:
@@ -5136,7 +6709,10 @@ def _prelude_check_stop(stop_event, *, base_dir: str, worker_id: int, progress: 
         is_set = False
     if not is_set:
         return
-    _prelude_save_worker_progress(base_dir, worker_id, progress, durable=True)
+    # Avoid a second full retry-window wait after persistent storage loss has
+    # already been detected by the I/O layer.
+    if not _PERSISTENT_STORAGE_LOSS_DETECTED:
+        _prelude_save_worker_progress(base_dir, worker_id, progress, durable=True)
     raise GracefulStop()
 
 
@@ -5147,7 +6723,6 @@ def _prelude_worker_row_block(
     row_end: int,
     rounds: int,
     net_seeds: Sequence[int],
-    rng_seed: Optional[int],
     base_dir: str,
     result_queue,
     status_queue: Optional[object] = None,
@@ -5171,17 +6746,16 @@ def _prelude_worker_row_block(
       * On restart, the worker resumes from its saved game_index.
     """
     init_ipc(status_queue, log_queue)
+    if stop_event is not None:
+        _set_active_stop_event(stop_event)
     try:
-        if rng_seed is None:
-            random.seed((os.getpid() << 16) ^ time.time_ns())
-        else:
-            random.seed(int(rng_seed) + 1000003 * int(worker_id))
+        _seed_process_move_randomness(f"prelude:{worker_id}:{row_start}:{row_end}")
 
         env = BattledanceEnvironment()
         seeds = _build_prelude_seed_agents(net_seeds)
         n = len(seeds)
-        if n != 60:
-            raise ValueError(f"Prelude expected 60 seed agents, got {n}.")
+        if n != _prelude_seed_count():
+            raise ValueError(f"Prelude expected {_prelude_seed_count()} seed agents, got {n}.")
 
         progress = _load_prelude_worker_progress(
             base_dir=base_dir,
@@ -5192,10 +6766,10 @@ def _prelude_worker_row_block(
             net_seeds=net_seeds,
         )
 
-        scores = [int(x) for x in progress.get("scores", [0] * 60)]
-        wins = [int(x) for x in progress.get("wins", [0] * 60)]
-        draws = [int(x) for x in progress.get("draws", [0] * 60)]
-        losses = [int(x) for x in progress.get("losses", [0] * 60)]
+        scores = [int(x) for x in progress.get("scores", [0] * _prelude_seed_count())]
+        wins = [int(x) for x in progress.get("wins", [0] * _prelude_seed_count())]
+        draws = [int(x) for x in progress.get("draws", [0] * _prelude_seed_count())]
+        losses = [int(x) for x in progress.get("losses", [0] * _prelude_seed_count())]
         local_games = int(progress.get("game_index", 0) or 0)
         total_games = int(progress.get("total_games", int(rounds) * (int(row_end) - int(row_start)) * 60) or 0)
 
@@ -5211,6 +6785,7 @@ def _prelude_worker_row_block(
             status(
                 f"[prelude W{worker_id}] game {local_games + 1}/{total_games} "
                 f"round {r + 1}/{rounds} white seed {i + 1} vs black seed {j + 1}"
+                f"{_prelude_eta_status_suffix(progress)}"
             )
 
             result = int(env.play_game(seeds[i], seeds[j]))
@@ -5301,10 +6876,10 @@ def _prelude_aggregate_worker_progress(
     rounds: int,
     net_seeds: Sequence[int],
 ) -> Tuple[List[int], List[int], List[int], List[int], int, bool]:
-    scores = [0 for _ in range(60)]
-    wins = [0 for _ in range(60)]
-    draws = [0 for _ in range(60)]
-    losses = [0 for _ in range(60)]
+    scores = [0 for _ in range(_prelude_seed_count())]
+    wins = [0 for _ in range(_prelude_seed_count())]
+    draws = [0 for _ in range(_prelude_seed_count())]
+    losses = [0 for _ in range(_prelude_seed_count())]
     total_games = 0
     all_done = True
 
@@ -5319,7 +6894,7 @@ def _prelude_aggregate_worker_progress(
         )
         total_games += int(progress.get("game_index", 0) or 0)
         all_done = all_done and bool(progress.get("done"))
-        for idx in range(60):
+        for idx in range(_prelude_seed_count()):
             scores[idx] += int(progress["scores"][idx])
             wins[idx] += int(progress["wins"][idx])
             draws[idx] += int(progress["draws"][idx])
@@ -5332,7 +6907,6 @@ def _prelude_finish_from_scores(
     *,
     base_dir: str,
     rounds: int,
-    seed: Optional[int],
     workers: int,
     net_seeds: List[int],
     seed_records: List[Dict[str, object]],
@@ -5341,7 +6915,7 @@ def _prelude_finish_from_scores(
     draws: List[int],
     losses: List[int],
 ) -> Tuple[List[Agent], List[Dict[str, object]], List[int]]:
-    ranked_indices = sorted(range(60), key=lambda idx: (-scores[idx], idx))
+    ranked_indices = sorted(range(_prelude_seed_count()), key=lambda idx: (-scores[idx], idx))
 
     for rank, idx in enumerate(ranked_indices, start=1):
         seed_records[idx]["score"] = int(scores[idx])
@@ -5358,10 +6932,9 @@ def _prelude_finish_from_scores(
         "kind": "prelude_seed_ranking",
         "rounds": int(rounds),
         "workers": int(workers),
-        "scheduled_games": int(rounds) * 60 * 60,
+        "scheduled_games": int(rounds) * _prelude_seed_count() * _prelude_seed_count(),
         "games_per_distinct_unordered_pair": 2 * int(rounds),
-        "self_intersections": 60 * int(rounds),
-        "seed": seed,
+        "self_intersections": _prelude_seed_count() * int(rounds),
         "snake_order": PRELUDE_SNAKE_ORDER,
         "ranked": ranked_records,
     }
@@ -5391,16 +6964,15 @@ def run_prelude_seed_ranking(
     *,
     base_dir: str,
     rounds: int = DEFAULT_PRELUDE_ROUNDS,
-    seed: Optional[int] = None,
     workers: int = DEFAULT_PRELUDE_WORKERS,
     env: Optional[BattledanceEnvironment] = None,
     stop_event=None,
 ) -> Tuple[List[Agent], List[Dict[str, object]], List[int]]:
     """
-    Generate 60 distinct Xavier initialisation seeds and rank them by a
+    Generate distinct Xavier initialisation seeds and rank them by a
     round-robin prelude.
 
-    The scheduled workload is `rounds * 60^2` games.  Each ordered pair
+    The scheduled workload is `rounds * seed_count^2` games.  Each ordered pair
     (i, j) is scored from seed i's perspective:
         score[i] += result
         score[j] -= result
@@ -5410,9 +6982,9 @@ def run_prelude_seed_ranking(
     `2 * rounds` games per pair; with the default rounds=8, that is 16 games
     per distinct seed pair.
 
-    With `workers=5`, the 60 white-seed rows are split into 5 workloads of
+    With `workers=5`, the white-seed rows are split into 5 workloads of
     12 white seeds each.  Each worker tests its 12 white seeds against all
-    60 black seeds for every round.
+    all black seeds for every round.
 
     Prelude resumability mirrors the GA style:
       * prelude_progress.json preserves the generated net seeds and config.
@@ -5426,17 +6998,18 @@ def run_prelude_seed_ranking(
     workers = int(workers)
     if workers <= 0:
         workers = 1
-    workers = min(workers, 60)
+    seed_count = _prelude_seed_count()
+    workers = min(workers, seed_count)
     chunks = _make_prelude_chunks(workers)
 
-    master = _load_or_create_prelude_master_state(base_dir=base_dir, rounds=rounds, seed=seed, workers=workers)
+    master = _load_or_create_prelude_master_state(base_dir=base_dir, rounds=rounds, workers=workers)
     net_seeds = [int(x) for x in master["net_seeds"]]  # type: ignore[index]
     seed_records = [dict(x) for x in master["seed_records"]]  # type: ignore[index]
 
-    total_games = rounds * 60 * 60
+    total_games = rounds * _prelude_seed_count() * _prelude_seed_count()
     log(
         f"[prelude] starting/resuming {total_games} games "
-        f"({rounds} * 60^2; {2 * rounds} games per distinct unordered seed pair; "
+        f"({rounds} * {_prelude_seed_count()}^2; {2 * rounds} games per distinct unordered seed pair; "
         f"workers={workers})."
     )
     log(
@@ -5456,7 +7029,6 @@ def run_prelude_seed_ranking(
         return _prelude_finish_from_scores(
             base_dir=base_dir,
             rounds=rounds,
-            seed=seed,
             workers=workers,
             net_seeds=net_seeds,
             seed_records=seed_records,
@@ -5477,10 +7049,9 @@ def run_prelude_seed_ranking(
         _prelude_worker_row_block(
             worker_id=1,
             row_start=0,
-            row_end=60,
+            row_end=_prelude_seed_count(),
             rounds=rounds,
             net_seeds=net_seeds,
-            rng_seed=seed,
             base_dir=base_dir,
             result_queue=result_queue,
             stop_event=stop_event,
@@ -5549,8 +7120,7 @@ def run_prelude_seed_ranking(
                     break
                 if LOG_PATH is not None:
                     try:
-                        with open(LOG_PATH, "a", encoding="utf-8") as f:
-                            f.write(line + "\n")
+                        _append_text_with_retry(LOG_PATH, line + "\n", durable=False)
                     except Exception:
                         pass
                 if also_print:
@@ -5581,7 +7151,6 @@ def run_prelude_seed_ranking(
                         "row_end": b,
                         "rounds": rounds,
                         "net_seeds": net_seeds,
-                        "rng_seed": seed,
                         "base_dir": base_dir,
                         "result_queue": result_queue,
                         "status_queue": status_queue,
@@ -5595,12 +7164,13 @@ def run_prelude_seed_ranking(
             for p in processes:
                 p.start()
 
-            results: List[Dict[str, object]] = []
-            remaining = len(processes)
-            while remaining > 0:
-                item = result_queue.get()
-                results.append(item)
-                remaining -= 1
+            results: List[Dict[str, object]] = _collect_worker_results_or_raise(
+                processes=processes,
+                result_queue=result_queue,
+                expected_count=len(processes),
+                context="Prelude",
+            )
+            for item in results:
                 wid = item.get("worker_id", "?")
                 a = int(item.get("row_start", 0))
                 b = int(item.get("row_end", 0))
@@ -5676,7 +7246,6 @@ def run_prelude_seed_ranking(
     return _prelude_finish_from_scores(
         base_dir=base_dir,
         rounds=rounds,
-        seed=seed,
         workers=workers,
         net_seeds=net_seeds,
         seed_records=seed_records,
@@ -5692,62 +7261,65 @@ def _save_prelude_assignment(
     ranked_agents: List[Agent],
     ranked_records: List[Dict[str, object]],
 ) -> None:
-    """
-    Snake-assign ranked prelude seeds to _1.._4 snapshots and _0 parents.
-
-    Assignment by rank:
-      _1: ranks  1..15 in PRELUDE_SNAKE_ORDER
-      _2: ranks 30..16 in PRELUDE_SNAKE_ORDER
-      _3: ranks 31..45 in PRELUDE_SNAKE_ORDER
-      _4: ranks 60..46 in PRELUDE_SNAKE_ORDER
-    """
-    if set(PRELUDE_SNAKE_ORDER) != set(agent_names):
+    """Snake-assign ranked prelude seeds to configured nonzero snapshots and _0 parents."""
+    if sorted(PRELUDE_SNAKE_ORDER) != sorted(agent_names):
         missing = sorted(set(agent_names) - set(PRELUDE_SNAKE_ORDER))
         extra = sorted(set(PRELUDE_SNAKE_ORDER) - set(agent_names))
         raise ValueError(
             f"PRELUDE_SNAKE_ORDER does not match agent_names. Missing={missing}, extra={extra}"
         )
 
-    if len(ranked_agents) != 60:
-        raise ValueError(f"Expected 60 ranked prelude agents, got {len(ranked_agents)}.")
+    expected = len(PRELUDE_SNAKE_ORDER) * len(SNAPSHOT_INDICES)
+    if len(ranked_agents) != expected:
+        raise ValueError(f"Expected {expected} ranked prelude agents, got {len(ranked_agents)}.")
 
     rank_positions_by_label: Dict[str, Dict[int, int]] = {}
+    labels_n = len(PRELUDE_SNAKE_ORDER)
 
     for i, label in enumerate(PRELUDE_SNAKE_ORDER):
-        # Zero-based ranked positions. Convert to one-based ranks in the metadata.
-        positions = {
-            1: i,          # ranks 1..15
-            2: 29 - i,     # ranks 30..16
-            3: 30 + i,     # ranks 31..45
-            4: 59 - i,     # ranks 60..46
-        }
+        positions: Dict[int, int] = {}
+        for block_idx, snap in enumerate(SNAPSHOT_INDICES):
+            block_start = block_idx * labels_n
+            if block_idx % 2 == 0:
+                pos = block_start + i
+            else:
+                pos = block_start + (labels_n - 1 - i)
+            positions[int(snap)] = int(pos)
         rank_positions_by_label[label] = positions
 
         snapshot_agents: Dict[int, Agent] = {}
         for snap, pos in positions.items():
             snapshot_agents[snap] = _clone_agent_as(ranked_agents[pos], label, trainable=False)
 
-        # _0 and _1 are parent lists.  Use the four assigned seeds, plus
-        # one direct clone of each, to preserve the 8-parent initial pool.
         parent_seeds = [snapshot_agents[s] for s in SNAPSHOT_INDICES]
         parents: List[Agent] = []
-        parents.extend([p.clone() for p in parent_seeds])
-        parents.extend([p.clone() for p in parent_seeds])
-        for p in parents:
-            p.name = label
-            p.trainable = False
+        while len(parents) < PARENT_COUNT:
+            for src in parent_seeds:
+                if len(parents) >= PARENT_COUNT:
+                    break
+                clone = src.clone()
+                clone.name = label
+                clone.trainable = False
+                parents.append(clone)
 
-        save_parents(parents, os.path.join(base_dir, f"{label}_0.pkl"))
-        save_parents(parents, os.path.join(base_dir, f"{label}_1.pkl"))
+        save_parents_verified(parents, os.path.join(base_dir, f"{label}_0.pkl"), label=f"{label}_0 prelude parents")
+        save_parents_verified(parents, os.path.join(base_dir, f"{label}_1.pkl"), label=f"{label}_1 prelude parents")
 
-        # _1 champion is parents[0].  _2.._4 are single champion files.
-        for snap in (2, 3, 4):
-            save_champion(snapshot_agents[snap], os.path.join(base_dir, f"{label}_{snap}.pkl"))
+        for snap in SNAPSHOT_INDICES:
+            if int(snap) == 1:
+                continue
+            save_champion_verified(
+                snapshot_agents[int(snap)],
+                os.path.join(base_dir, f"{label}_{int(snap)}.pkl"),
+                label=f"{label}_{int(snap)} prelude champion",
+            )
 
     assignment_payload: Dict[str, object] = {
         "kind": "prelude_snake_assignment",
         "snapshot_indices": list(SNAPSHOT_INDICES),
         "snake_order": PRELUDE_SNAKE_ORDER,
+        "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
+        "parent_count": PARENT_COUNT,
         "labels": {},
     }
 
@@ -5755,118 +7327,134 @@ def _save_prelude_assignment(
     for label, positions in rank_positions_by_label.items():
         labels_payload[label] = {
             f"_{snap}": {
-                "rank": positions[snap] + 1,
-                "seed_record": ranked_records[positions[snap]],
+                "rank": positions[int(snap)] + 1,
+                "seed_record": ranked_records[positions[int(snap)]],
             }
             for snap in SNAPSHOT_INDICES
         }
     assignment_payload["labels"] = labels_payload
+    _safe_write_json(os.path.join(base_dir, "prelude_assignment.json"), assignment_payload, indent=2, durable=True)
+    log("[prelude] snake assignment saved to configured snapshots.")
 
-    try:
-        _safe_write_json(os.path.join(base_dir, "prelude_assignment.json"), assignment_payload, indent=2, durable=True)
-    except Exception:
-        pass
+def _existing_snapshot_files(agent_names: Sequence[str], base_dir: str) -> List[str]:
+    """Return existing <Name>_<0..4>.pkl snapshot files in models/."""
+    found: List[str] = []
+    for name in agent_names:
+        for snap in (0,) + SNAPSHOT_INDICES:
+            path = os.path.join(base_dir, f"{name}_{snap}.pkl")
+            if _path_exists_respecting_transient_storage(path):
+                found.append(path)
+    return found
 
-    log("[prelude] snake assignment saved to _0.._4 snapshots.")
 
-
-def initialize_agents(
-    agent_names: List[str],
-    base_dir: str,
-    *,
-    use_prelude: bool = False,
-    prelude_rounds: int = DEFAULT_PRELUDE_ROUNDS,
-    prelude_seed: Optional[int] = None,
-    prelude_workers: int = DEFAULT_PRELUDE_WORKERS,
-) -> None:
+def _assert_safe_to_initialize(agent_names: Sequence[str], base_dir: str, state_path: str) -> None:
     """
-    Initialise snapshot files on first run.  Creates initial parent sets
-    and snapshot copies.  Does not overwrite existing files.
-
-    Normal initialisation:
-      * For each agent, create 4 Xavier seed networks.
-      * Save those four seeds plus four copies as _0 and _1 parents.
-      * Save distinct champions into _2, _3, and _4.
-
-    Prelude initialisation, if enabled:
-      * Generate 60 distinct Xavier seed networks.
-      * Run `prelude_rounds * 60^2` games, scored with clean self-cancellation.
-      * Rank the seeds and snake-assign one seed per label per snapshot.
-      * Save each label's assigned seeds into _0.._4.
+    Refuse first-run initialization if snapshot files already exist but
+    training_state.json is missing.  This prevents an accidental state-file loss
+    from overwriting evolved snapshots with fresh/prelude initialization.
     """
-    os.makedirs(base_dir, exist_ok=True)
-
-    # Check if already initialised.
-    state_path = os.path.join(base_dir, "training_state.json")
     if os.path.exists(state_path):
         return
 
-    env = BattledanceEnvironment()
-
-    if use_prelude:
-        ranked_agents, ranked_records, _ = run_prelude_seed_ranking(
-            base_dir=base_dir,
-            rounds=prelude_rounds,
-            seed=prelude_seed,
-            workers=prelude_workers,
-            env=env,
+    existing = _existing_snapshot_files(agent_names, base_dir)
+    if existing:
+        preview = ", ".join(os.path.basename(x) for x in existing[:8])
+        if len(existing) > 8:
+            preview += f", ... ({len(existing)} total)"
+        raise RuntimeError(
+            "models/ contains existing agent snapshot files, but training_state.json is missing. "
+            "Refusing to initialize because this could overwrite existing training state. "
+            f"Existing snapshots include: {preview}. Restore training_state.json, move/backup models/, "
+            "or intentionally start from an empty models/ directory."
         )
-        _save_prelude_assignment(
-            agent_names=agent_names,
-            base_dir=base_dir,
-            ranked_agents=ranked_agents,
-            ranked_records=ranked_records,
-        )
-    else:
-        rnd = np.random.RandomState()
-        for name in agent_names:
-            # 4 Xavier seeds.
-            seeds: List[Agent] = []
-            used: set[int] = set()
-            for _ in range(4):
-                net_seed = _unique_net_seed(rnd, used)
-                a = Agent(
-                    name=name,
-                    net=MLP(input_dim=594, hidden_dim=512, seed=net_seed),
-                    trainable=False,
-                )
-                seeds.append(a)
-
-            # 4 straight copies as additional parents.
-            parents: List[Agent] = []
-            parents.extend([s.clone() for s in seeds])
-            parents.extend([s.clone() for s in seeds])
-
-            for p in parents:
-                p.trainable = False
-
-            # Save parent sets for snapshot 0 and 1.
-            save_parents(parents, os.path.join(base_dir, f"{name}_0.pkl"))
-            save_parents(parents, os.path.join(base_dir, f"{name}_1.pkl"))
-
-            # Snapshot 1 champion = parents[0] = seeds[0]
-            # Snapshot 2 champion = seeds[1]
-            # Snapshot 3 champion = seeds[2]
-            # Snapshot 4 champion = seeds[3]
-            save_champion(seeds[1], os.path.join(base_dir, f"{name}_2.pkl"))
-            save_champion(seeds[2], os.path.join(base_dir, f"{name}_3.pkl"))
-            save_champion(seeds[3], os.path.join(base_dir, f"{name}_4.pkl"))
-
-    # Write initial state (atomic).
-    try:
-        _safe_write_json(state_path, {"cycle": 0}, indent=2, durable=True)
-    except Exception:
-        pass
 
 
 
-def main() -> None:
-    # Define agent names and opponent lists
-    agent_names = [
+###############################################################################
+#  training_config.ini support
+###############################################################################
+
+@dataclass
+class TrainingConfig:
+    agent_names: List[str]
+    opponent_lists: Dict[str, List[str]]
+    thread_modes: Dict[str, List[List[str]]]
+    default_threads_mode: Optional[str]
+    prelude_rounds: int
+    prelude_workers: int
+    snake_order: List[str]
+    kept_snapshots: Tuple[int, ...]
+    training_snapshots: Tuple[int, ...]
+    io_retry_seconds: float
+    io_retry_initial_delay: float
+    io_retry_max_delay: float
+    hidden_layers: Tuple[int, ...]
+
+
+def _split_csv(value: object) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.replace("\n", ",").split(",") if part.strip()]
+
+
+def _split_thread_groups(value: object) -> List[List[str]]:
+    groups: List[List[str]] = []
+    for group in str(value or "").split("|"):
+        names = _split_csv(group)
+        if names:
+            groups.append(names)
+    return groups
+
+
+def _parse_schedule(value: object, default: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+    text = str(value or "").strip()
+    if not text:
+        return list(default)
+    out: List[Tuple[int, float]] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Schedule entry {part!r} must be cycle:value.")
+        a, b = part.split(":", 1)
+        out.append((int(a.strip()), float(b.strip())))
+    out.sort(key=lambda x: x[0])
+    return out or list(default)
+
+
+def _parse_hidden_layers(value: object, default: Tuple[int, ...] = HIDDEN_LAYER_SIZES) -> Tuple[int, ...]:
+    text = str(value or "").strip()
+    if not text:
+        return tuple(int(x) for x in default)
+    layers = tuple(int(x) for x in _split_csv(text))
+    if not layers:
+        raise ValueError("[network] hidden_layers must contain at least one positive integer width.")
+    if any(x <= 0 for x in layers):
+        raise ValueError(f"[network] hidden_layers must be positive integer widths; got {layers!r}.")
+    return layers
+
+
+def _schedule_value(schedule: Sequence[Tuple[int, float]], cycle: int) -> float:
+    value = float(schedule[0][1]) if schedule else 0.0
+    for start_cycle, v in schedule:
+        if int(cycle) >= int(start_cycle):
+            value = float(v)
+        else:
+            break
+    return value
+
+
+def _default_agent_names() -> List[str]:
+    return [
         "Red", "Grn", "Blu", "Cyn", "Mag", "Yel", "NoN",
         "deR", "nrG", "ulB", "nyC", "gaM", "leY", "XyZ", "ZyX",
     ]
-    opponent_lists: Dict[str, List[str]] = {
+
+
+def _default_opponent_lists() -> Dict[str, List[str]]:
+    return {
         "Red": ["NoN", "Grn", "ulB", "Cyn", "gaM", "Yel", "ZyX", "Red"],
         "Grn": ["deR", "NoN", "Blu", "Cyn", "Mag", "leY", "ZyX", "Grn"],
         "Blu": ["Red", "nrG", "NoN", "nyC", "Mag", "Yel", "ZyX", "Blu"],
@@ -5880,135 +7468,306 @@ def main() -> None:
         "nyC": ["Red", "Grn", "ulB", "Cyn", "Mag", "leY", "ZyX", "nyC"],
         "gaM": ["deR", "Grn", "Blu", "nyC", "Mag", "Yel", "ZyX", "gaM"],
         "leY": ["Red", "nrG", "Blu", "Cyn", "gaM", "Yel", "ZyX", "leY"],
-        "XyZ": [
-                "Red", "Grn", "Blu", "Cyn", "Mag", "Yel", "NoN",
-                "deR", "nrG", "ulB", "nyC", "gaM", "leY", "XyZ",
-        ],
+        "XyZ": ["Red", "Grn", "Blu", "Cyn", "Mag", "Yel", "NoN", "deR", "nrG", "ulB", "nyC", "gaM", "leY", "XyZ"],
         "ZyX": ["XyZ", "ZyX"],
     }
 
-    # CLI argument for thread mode
+
+def _default_thread_modes(agent_names: Sequence[str]) -> Dict[str, List[List[str]]]:
+    names = list(agent_names)
+    if names == _default_agent_names():
+        return {
+            "1": [["ZyX", "nyC", "deR", "Cyn", "Red", "XyZ", "gaM", "nrG", "Mag", "Grn", "leY", "ulB", "NoN", "Yel", "Blu"]],
+            "3": [["deR", "Red", "Mag", "ulB", "Blu"], ["nyC", "Cyn", "gaM", "leY", "Yel"], ["ZyX", "XyZ", "nrG", "Grn", "NoN"]],
+            "5": [["Red", "Grn", "Blu"], ["Cyn", "Mag", "Yel"], ["ZyX", "XyZ", "NoN"], ["deR", "nrG", "ulB"], ["nyC", "gaM", "leY"]],
+        }
+    return {"1": [names]}
+
+
+def _parse_snapshot_indices(raw_kept: object, raw_training: object) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    kept_s = str(raw_kept or "").strip()
+    if kept_s:
+        if kept_s.isdigit():
+            kept = tuple(range(1, int(kept_s) + 1))
+        else:
+            kept = tuple(int(x) for x in _split_csv(kept_s))
+    else:
+        kept = (1, 2, 3, 4)
+    kept = tuple(sorted(dict.fromkeys(x for x in kept if x >= 1))) or (1,)
+    training_s = str(raw_training or "").strip()
+    training = tuple(int(x) for x in _split_csv(training_s)) if training_s else kept
+    training = tuple(x for x in sorted(dict.fromkeys(training)) if x in set(kept)) or (kept[0],)
+    return kept, training
+
+
+def _resolve_opponents(name: str, raw: object, agent_names: Sequence[str]) -> List[str]:
+    text = str(raw or "").strip()
+    if not text or text.lower() == "all":
+        return list(agent_names)
+    if text.lower() == "self":
+        return [name]
+    if text.lower() == "all_other":
+        return [x for x in agent_names if x != name]
+    return _split_csv(text)
+
+
+def _load_training_config(path: str) -> TrainingConfig:
+    global SNAPSHOT_INDICES, TRAINING_SNAPSHOT_INDICES, PRELUDE_SNAKE_ORDER
+    global PARENT_COUNT, CHILDREN_PER_PARENT_INTERSECTION, ELITE_COUNT
+    global STAGE1_ROUNDS, STAGE2_FINALISTS, STAGE2_ROUNDS, WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS
+    global MUTATION_RATE_SCHEDULE, WEIGHT_DECAY_SCHEDULE
+    global MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER, MUTATION_BIAS_NOISE_SCALE
+    global MOVE_CHOICE_THRESHOLD, TERMINAL_WIN_SCORE, CYCLE_CHAMPION_RR_REPS
+    global IO_RETRY_SECONDS, IO_RETRY_INITIAL_DELAY, IO_RETRY_MAX_DELAY
+    global HIDDEN_LAYER_SIZES
+
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    if _path_exists_respecting_transient_storage(path):
+        parser.read(path, encoding="utf-8")
+
+    names = _split_csv(parser.get("agents", "names", fallback=""))
+    if not names:
+        names = ["Solo"] if parser.has_section("agents") else _default_agent_names()
+
+    kept, training = _parse_snapshot_indices(
+        parser.get("snapshots", "kept_nonzero_snapshots", fallback=""),
+        parser.get("snapshots", "training_snapshots", fallback=""),
+    )
+
+    if names == _default_agent_names() and not parser.has_section("opponents"):
+        opponent_lists = _default_opponent_lists()
+    else:
+        default_raw = parser.get("opponents", "default", fallback="all") if parser.has_section("opponents") else "all"
+        opponent_lists = {}
+        known = set(names)
+        for name in names:
+            raw = parser.get("opponents", name, fallback=None) if parser.has_section("opponents") else None
+            opps = _resolve_opponents(name, raw if raw is not None else default_raw, names)
+            unknown = [x for x in opps if x not in known]
+            if unknown:
+                raise ValueError(f"Opponent list for {name!r} contains unknown agent name(s): {unknown}")
+            opponent_lists[name] = opps
+
+    snake_default = ",".join(PRELUDE_SNAKE_ORDER if names == _default_agent_names() else names)
+    snake_order = _split_csv(parser.get("prelude", "snake_order", fallback=snake_default))
+    if sorted(snake_order) != sorted(names):
+        raise ValueError("[prelude] snake_order must contain exactly the same names as [agents] names.")
+
+    thread_modes = _default_thread_modes(names)
+    if parser.has_section("threads"):
+        for key, value in parser.items("threads"):
+            if key == "default":
+                continue
+            groups = _split_thread_groups(value)
+            if groups:
+                thread_modes[str(key)] = groups
+    default_threads_mode = parser.get("threads", "default", fallback=None) if parser.has_section("threads") else None
+
+    cfg = TrainingConfig(
+        agent_names=names,
+        opponent_lists=opponent_lists,
+        thread_modes=thread_modes,
+        default_threads_mode=default_threads_mode,
+        prelude_rounds=parser.getint("prelude", "rounds", fallback=DEFAULT_PRELUDE_ROUNDS),
+        prelude_workers=parser.getint("prelude", "workers", fallback=DEFAULT_PRELUDE_WORKERS),
+        snake_order=snake_order,
+        kept_snapshots=kept,
+        training_snapshots=training,
+        io_retry_seconds=parser.getfloat("runtime", "io_retry_seconds", fallback=IO_RETRY_SECONDS),
+        io_retry_initial_delay=parser.getfloat("runtime", "io_retry_initial_delay", fallback=IO_RETRY_INITIAL_DELAY),
+        io_retry_max_delay=parser.getfloat("runtime", "io_retry_max_delay", fallback=IO_RETRY_MAX_DELAY),
+        hidden_layers=_parse_hidden_layers(parser.get("network", "hidden_layers", fallback=""), HIDDEN_LAYER_SIZES),
+    )
+
+    SNAPSHOT_INDICES = cfg.kept_snapshots
+    TRAINING_SNAPSHOT_INDICES = cfg.training_snapshots
+    PRELUDE_SNAKE_ORDER = list(cfg.snake_order)
+    IO_RETRY_SECONDS = max(0.0, float(cfg.io_retry_seconds))
+    IO_RETRY_INITIAL_DELAY = max(0.05, float(cfg.io_retry_initial_delay))
+    IO_RETRY_MAX_DELAY = max(IO_RETRY_INITIAL_DELAY, float(cfg.io_retry_max_delay))
+    HIDDEN_LAYER_SIZES = tuple(int(x) for x in cfg.hidden_layers)
+    PARENT_COUNT = max(1, parser.getint("population", "parents", fallback=PARENT_COUNT))
+    CHILDREN_PER_PARENT_INTERSECTION = max(0, parser.getint("population", "children_per_parent_intersection", fallback=CHILDREN_PER_PARENT_INTERSECTION))
+    ELITE_COUNT = max(0, parser.getint("population", "elites", fallback=ELITE_COUNT))
+    STAGE1_ROUNDS = max(1, parser.getint("evaluation", "stage1_rounds", fallback=STAGE1_ROUNDS))
+    STAGE2_FINALISTS = max(0, parser.getint("evaluation", "stage2_finalists", fallback=STAGE2_FINALISTS))
+    STAGE2_ROUNDS = max(STAGE1_ROUNDS, parser.getint("evaluation", "stage2_rounds", fallback=STAGE2_ROUNDS))
+    WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS = max(
+        0,
+        parser.getint(
+            "evaluation",
+            "worst_only_every_unsuccessful_generations",
+            fallback=WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS,
+        ),
+    )
+    MUTATION_RATE_SCHEDULE = _parse_schedule(parser.get("mutation", "rate_schedule", fallback=""), MUTATION_RATE_SCHEDULE)
+    WEIGHT_DECAY_SCHEDULE = _parse_schedule(parser.get("mutation", "weight_decay_schedule", fallback=""), WEIGHT_DECAY_SCHEDULE)
+    MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER = parser.getfloat("mutation", "weight_noise_scale_multiplier", fallback=MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER)
+    MUTATION_BIAS_NOISE_SCALE = parser.getfloat("mutation", "bias_noise_scale", fallback=MUTATION_BIAS_NOISE_SCALE)
+    MOVE_CHOICE_THRESHOLD = min(0.999999, max(0.0, parser.getfloat("move_choice", "candidate_threshold", fallback=MOVE_CHOICE_THRESHOLD)))
+    TERMINAL_WIN_SCORE = parser.getfloat("move_choice", "terminal_win_score", fallback=TERMINAL_WIN_SCORE)
+    CYCLE_CHAMPION_RR_REPS = max(0, parser.getint("cycle_rr", "reps", fallback=CYCLE_CHAMPION_RR_REPS))
+    return cfg
+
+
+def _resolve_thread_mode_groups(thread_mode: Optional[str], config: TrainingConfig) -> Tuple[str, List[List[str]]]:
+    mode = str(thread_mode or config.default_threads_mode or "1")
+    if mode in config.thread_modes:
+        groups = [list(g) for g in config.thread_modes[mode]]
+    elif mode.isdigit():
+        n = min(max(1, int(mode)), len(config.agent_names))
+        base = len(config.agent_names) // n
+        rem = len(config.agent_names) % n
+        groups = []
+        start = 0
+        for idx in range(n):
+            size = base + (1 if idx < rem else 0)
+            groups.append(config.agent_names[start:start + size])
+            start += size
+    else:
+        raise ValueError(f"Unknown threads mode {mode!r}. Define it in [threads] or use a numeric string.")
+    flat = [x for g in groups for x in g]
+    unknown = [x for x in flat if x not in set(config.agent_names)]
+    duplicates = sorted({x for x in flat if flat.count(x) > 1})
+    missing = [x for x in config.agent_names if x not in flat]
+    if unknown or duplicates or missing:
+        raise ValueError(f"threads mode {mode!r} must cover each agent exactly once; unknown={unknown}, duplicates={duplicates}, missing={missing}")
+    return mode, groups
+
+def initialize_agents(
+    agent_names: List[str],
+    base_dir: str,
+    *,
+    prelude_rounds: int = DEFAULT_PRELUDE_ROUNDS,
+    prelude_workers: int = DEFAULT_PRELUDE_WORKERS,
+) -> None:
+    """Canonical first-run initialization: always use prelude initialization."""
+    os.makedirs(base_dir, exist_ok=True)
+    state_path = os.path.join(base_dir, "training_state.json")
+    if _path_exists_respecting_transient_storage(state_path):
+        return
+    _assert_safe_to_initialize(agent_names, base_dir, state_path)
+
+    env = BattledanceEnvironment()
+    ranked_agents, ranked_records, _ = run_prelude_seed_ranking(
+        base_dir=base_dir,
+        rounds=prelude_rounds,
+        workers=prelude_workers,
+        env=env,
+    )
+    _save_prelude_assignment(
+        agent_names=agent_names,
+        base_dir=base_dir,
+        ranked_agents=ranked_agents,
+        ranked_records=ranked_records,
+    )
+
+    _safe_write_json(state_path, {"cycle": 0}, indent=2, durable=True)
+    state_check = _safe_read_json(state_path)
+    try:
+        state_cycle = int(state_check.get("cycle", -1)) if isinstance(state_check, dict) else -1
+    except Exception:
+        state_cycle = -1
+    if state_cycle != 0:
+        raise RuntimeError(f"Initial training_state.json write verification failed at {state_path!r}.")
+
+def main() -> None:
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_config.ini")
+    config = _load_training_config(config_path)
+
     parser = argparse.ArgumentParser(description="Battledance Chess training driver")
     parser.add_argument(
         "--threads-mode",
-        choices=["1", "3", "5"],
-        default="5",
-        help="Thread grouping mode: '1', '3', or '5'.",
-    )
-    parser.add_argument(
-        "--prelude-init",
-        action="store_true",
-        help=(
-            "Explicitly rank 60 Xavier seeds with a prelude round-robin and "
-            "snake-assign them into _1.._4 snapshots. This is already the "
-            "default for a fresh/empty models directory."
-        ),
-    )
-    parser.add_argument(
-        "--no-prelude-init",
-        action="store_true",
-        help=(
-            "On a fresh/empty models directory, skip the default prelude and "
-            "use the older direct Xavier snapshot initialization instead."
-        ),
-    )
-    parser.add_argument(
-        "--prelude-rounds",
-        type=int,
-        default=DEFAULT_PRELUDE_ROUNDS,
-        help=(
-            "Ordered-pair repetitions for --prelude-init. "
-            "Default 8 means 8*60^2 scheduled games and 16 games per distinct unordered seed pair."
-        ),
-    )
-    parser.add_argument(
-        "--prelude-seed",
-        type=int,
         default=None,
-        help="Optional RNG seed for reproducible prelude seed generation and tie-breaking games.",
-    )
-    parser.add_argument(
-        "--prelude-workers",
-        type=int,
-        default=DEFAULT_PRELUDE_WORKERS,
         help=(
-            "Number of parallel worker processes for --prelude-init. "
-            "Default 5 splits the 60 white-seed rows into 5 workloads of 12 seeds each."
+            "Worker grouping mode name. If omitted, uses [threads] default; if that is missing, "
+            "falls back to one worker in configured agent-name order. Numeric strings auto-split "
+            "agent names if no explicit mode of that name exists."
         ),
     )
+    parser.add_argument("--prelude-rounds", type=int, default=None, help="Override [prelude] rounds.")
+    parser.add_argument("--prelude-workers", type=int, default=None, help="Override [prelude] workers.")
     args = parser.parse_args()
-    thread_mode = args.threads_mode
 
-    # Base directory for models
+    thread_mode, thread_groups = _resolve_thread_mode_groups(args.threads_mode, config)
+    prelude_rounds = int(args.prelude_rounds if args.prelude_rounds is not None else config.prelude_rounds)
+    prelude_workers = int(args.prelude_workers if args.prelude_workers is not None else config.prelude_workers)
+
+    agent_names = list(config.agent_names)
+    opponent_lists = {name: list(config.opponent_lists.get(name, agent_names)) for name in agent_names}
+
     base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-
-    # Read/init state path before first-run initialisation.
     state_path = os.path.join(base_dir, "training_state.json")
 
-    default_prelude = (not args.no_prelude_init) and _should_default_to_prelude(base_dir, state_path)
-    use_prelude_init = bool(args.prelude_init or default_prelude)
-
-    # If the first run will do prelude work, set up logging before initialisation
-    # so the prelude has a durable log.
-    if use_prelude_init and not os.path.exists(state_path):
+    if not _path_exists_respecting_transient_storage(state_path):
         setup_logging(base_dir, 0)
 
-    # Initialise agents on first run only.
     try:
         initialize_agents(
             agent_names,
             base_dir,
-            use_prelude=use_prelude_init,
-            prelude_rounds=args.prelude_rounds,
-            prelude_seed=args.prelude_seed,
-            prelude_workers=args.prelude_workers,
+            prelude_rounds=prelude_rounds,
+            prelude_workers=prelude_workers,
         )
     except GracefulStop:
-        log("[prelude] graceful stop requested; prelude progress saved. Re-run with the same prelude args to resume.")
+        log("[prelude] graceful stop requested; prelude progress saved. Re-run with the same config/args to resume.")
         return
 
-    # Read current cycle from state, robust against transient storage failures.
     state_obj = _safe_read_json(state_path)
-    if isinstance(state_obj, dict):
-        cycle = int(state_obj.get("cycle", 0) or 0)
-    else:
-        cycle = 0
+    if not isinstance(state_obj, dict):
+        raise RuntimeError(
+            f"training_state.json is missing, unreadable, or corrupt at {state_path!r}; "
+            "refusing to assume cycle 0."
+        )
+    cycle = int(state_obj.get("cycle", 0) or 0)
 
-    # Set up logging for this run
     setup_logging(base_dir, cycle)
-
     rnd = np.random.RandomState()
 
-    log(f"=== Training cycle {cycle} starting (threads-mode={thread_mode}) ===")
-    completed = run_training_cycle(agent_names, opponent_lists, base_dir, rnd, cycle, thread_mode=thread_mode)
+    log(
+        f"=== Training cycle {cycle} starting (threads-mode={thread_mode}; agents={len(agent_names)}; "
+        f"kept_snapshots={list(SNAPSHOT_INDICES)}; training_snapshots={list(TRAINING_SNAPSHOT_INDICES)}; hidden_layers={list(HIDDEN_LAYER_SIZES)}) ==="
+    )
+    try:
+        completed = run_training_cycle(
+            agent_names,
+            opponent_lists,
+            base_dir,
+            rnd,
+            cycle,
+            thread_mode=thread_mode,
+            thread_groups_override=thread_groups,
+        )
+    except GracefulStop:
+        log(f"=== Training cycle {cycle} graceful stop requested; snapshots NOT rotated and cycle counter NOT advanced. ===")
+        return
 
     if not completed:
         log(f"=== Training cycle {cycle} aborted; snapshots NOT rotated and cycle counter NOT advanced. ===")
         return
 
     try:
-        if _is_cycle_rotation_done(base_dir, cycle):
+        if _is_cycle_rotation_done(base_dir, cycle, agent_names):
             log(f"[global] cycle {cycle}: rotation already marked done; skipping snapshot rotation.")
         else:
             rotation_result = safe_rotate_snapshots_verified(agent_names, base_dir, cycle)
-            _mark_cycle_rotation_done(base_dir, cycle)
+            _mark_cycle_rotation_done(base_dir, cycle, agent_names)
             try:
                 _write_rotation_summary(base_dir, cycle, rotation_result)
             except Exception as e:
-                log(
-                    f"[global] cycle {cycle}: WARNING: rotation verified/done, "
-                    f"but summary write failed: {e!r}"
-                )
+                log(f"[global] cycle {cycle}: WARNING: rotation verified/done, but summary write failed: {e!r}")
             _cleanup_cycle_rotation_plans(base_dir, cycle, agent_names)
             log(f"[global] cycle {cycle}: snapshots rotated, verified, rotation marker written, and summary attempted.")
 
-        run_cycle_champions_round_robin(
-            agent_names,
-            base_dir,
-            cycle,
-            thread_mode=thread_mode,
-            reps=CYCLE_CHAMPION_RR_REPS,
-        )
+        if CYCLE_CHAMPION_RR_REPS > 0:
+            run_cycle_champions_round_robin(
+                agent_names,
+                base_dir,
+                cycle,
+                thread_mode=thread_mode,
+                reps=CYCLE_CHAMPION_RR_REPS,
+            )
     except RotationError as e:
         log(
             f"[global] cycle {cycle}: snapshot rotation failed verification; "
@@ -6022,7 +7781,14 @@ def main() -> None:
         )
         return
 
-    update_cycle_counter(base_dir)
+    try:
+        update_cycle_counter(base_dir)
+    except Exception as e:
+        log(
+            f"[global] cycle {cycle}: training completed and champion RR finalized, "
+            f"but cycle counter advance failed verification: {e!r}. Re-run should retry/skip completed work from markers."
+        )
+        return
     log(f"=== Training cycle {cycle} completed; snapshots rotated, champion RR completed, cycle counter advanced. ===")
 
 
