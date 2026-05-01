@@ -46,7 +46,9 @@ The internal starting-position string is:
 rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
 ```
 
-![Battledance Chess starting 2 ranks](concept.png)
+Above ASCII board again as image, in case it somehow doesn't render monospaced for anyone's viewport:
+
+![ASCII board as image](battledance_start_ascii_black_grid.png)
 
 ---
 
@@ -80,6 +82,7 @@ A sliding piece keeps moving in a straight legal direction until it stops, captu
 The small 7×7 movement grid in this repository is a visual reference for the short-range leap classes, centered on `(0,0)`. It is not the game board.
 
 ![7x7 move-class grid](battledance-chess-move-display.png)
+![Battledance Chess starting 2 ranks](concept.png)
 
 ---
 
