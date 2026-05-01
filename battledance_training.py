@@ -5,7 +5,7 @@
 # it under the terms of the GNU General Public License version 3 or
 # later as published by the Free Software Foundation.
 #
-# See the LICENSE.txt file in the project root for details.
+# See the LICENSE file in the project root for details.
 
 # Jacob Scow, a.k.a., RadiantDarkBlaze
 
