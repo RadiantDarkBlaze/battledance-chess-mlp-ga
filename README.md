@@ -106,15 +106,16 @@ rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
 That means Black starts on the top two ranks and White starts on the bottom two ranks:
 
 ```text
-8  r g l b b l g r
-7  p f n k k n f p
-6  . . . . . . . .
-5  . . . . . . . .
-4  . . . . . . . .
-3  . . . . . . . .
-2  P F N K K N F P
-1  R G L B B L G R
-   a b c d e f g h
+xx a= b= c= d= e= f= g= h= xx
+=8 ,r .g ,l .b ,b .l ,g .r =8
+=7 .p ,f .n ,k .k ,n .f ,p =7
+=6 ,, .. ,, .. ,, .. ,, .. =6
+=5 .. ,, .. ,, .. ,, .. ,, =5
+=4 ,, .. ,, .. ,, .. ,, .. =4
+=3 .. ,, .. ,, .. ,, .. ,, =3
+=2 ,P .F ,N .K ,K .N ,F .P =2
+=1 .R ,G .L ,B .B ,L .G ,R =1
+xx a= b= c= d= e= f= g= h= xx
 ```
 
 Uppercase pieces are White. Lowercase pieces are Black.
