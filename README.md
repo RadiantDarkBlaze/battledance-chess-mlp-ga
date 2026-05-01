@@ -52,11 +52,9 @@ rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
 
 ## Objective
 
-The **Bishop** is royal. Capturing any opposing Bishop wins immediately.
+The **Bishop** is royal. You may not expose either of your own bishops to opponent check, or leave them in unaddressed check when your opponent attacks them.
 
-A player also loses if they have no legal moves.
-
-One important rule: if a Bishop capture is available, the engine treats Bishop-capturing moves as the only legal moves for that turn. In practice, if you can take a royal Bishop, you must end the game.
+A player loses if they have no legal moves; unlike regular chess, stalemate is a loss, not a draw.
 
 ---
 
