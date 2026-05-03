@@ -46,6 +46,8 @@ The internal starting-position string is:
 rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1
 ```
 
+![Battledance Chess starting 2 ranks](concept.png)
+
 ---
 
 ## Objective
@@ -78,11 +80,6 @@ A sliding piece keeps moving in a straight legal direction until it stops, captu
 The small 7×7 movement grid in this repository is a visual reference for the short-range leap classes, centered on `(0,0)`. It is not the game board.
 
 ![7x7 move-class grid](battledance-chess-move-display.png)
-![Battledance Chess starting 2 ranks](concept.png)
-
-Above ASCII board again as image, in case it somehow doesn't render monospaced for anyone's viewport:
-
-![ASCII board as image](battledance_start_ascii_black_grid.png)
 
 ---
 
@@ -132,6 +129,8 @@ side to move
 draw and repetition counters
 ```
 
+More exactly, the board portion uses 9 separate 8×8 planes: one plane for each of the 8 piece types, plus one aggregate occupancy/color plane. The remaining inputs encode pieces in hand, side to move, and draw/repetition counters.
+
 The default network shape is:
 
 ```text
@@ -156,6 +155,8 @@ When choosing a move, the agent:
 4. gives immediate wins a huge score;
 5. treats terminal draws as neutral;
 6. randomly chooses among the high-scoring moves, weighted toward the better ones.
+
+For move choice, **normalized** means relative to the legal moves in the current position. The worst-scored legal move becomes `0`, the best-scored legal move becomes `1`, and the rest fall between them. The agent then chooses from moves above the configured threshold, weighted toward the higher normalized scores. If all legal moves are effectively tied, it chooses randomly.
 
 It is not doing deep chess-engine search. It is using one-move lookahead plus its learned board evaluator.
 
@@ -248,15 +249,27 @@ Name_3.pkl   Older retained champion snapshot.
 Name_4.pkl   Older retained champion snapshot.
 ```
 
-The `_0` slot is active during training. The `_1` through `_4` slots are opponent history.
+The `_0` slot is active during training. It may temporarily contain a full saved candidate population while a GA generation is in progress. After a successful generation, `_0` is pruned back down to the selected parent list.
+
+The `_1` through `_4` slots are opponent history. Their file formats are intentionally not all the same:
+
+```text
+_1       parent-list payload
+_2.._4   single-champion payloads
+```
+
+When the code needs a single champion from a parent-list file, it uses the first parent in the list. This is deliberate compatibility behavior, not proof that every snapshot file has the same internal format.
+
+Prelude also follows this layout. It writes `_0` and `_1` as identical parent lists made by cycling through that agent's four assigned prelude seeds. It writes `_2`, `_3`, and `_4` as single champion snapshots.
 
 After a successful cycle, snapshots rotate:
 
 ```text
-_0 -> _1
-_1 -> _2
-_2 -> _3
-_3 -> _4
+_0 selected parents -> _1 parent list
+old _1 first parent -> _2 champion
+old _2 champion     -> _3 champion
+old _3 champion     -> _4 champion
+old _4 champion     -> dropped
 ```
 
 The rotation is plan-based and verified. If an interruption happens partway through rotation, the script uses its saved rotation plan rather than guessing from possibly half-rotated files.
@@ -297,7 +310,19 @@ Stage 1: test every candidate with a smaller game budget.
 Stage 2: spend more games only on the best finalists.
 ```
 
-The success gate is strict: the chosen parents must have non-negative margins against every required opponent snapshot at the configured evaluation depth. A candidate that is strong on average but clearly loses to one required opponent can fail the gate.
+For fitness ranking, **normalized** means relative to the candidates currently being compared. The worst value becomes `0`, the best value becomes `1`, and tied-all-equal values become `1` for everyone.
+
+Normal fitness rewards both overall score and consistency:
+
+```text
+normalized(total margin) × normalized(minimum margin)
+```
+
+`total margin` rewards broad performance across all required opponent snapshots. `minimum margin` rewards avoiding a bad matchup against any one required opponent snapshot.
+
+The success gate is stricter than the ranking score: the chosen parents must have non-negative margins against every required opponent snapshot at the configured evaluation depth. A candidate that is strong on average but clearly loses to one required opponent can fail the gate.
+
+There is also a rare fallback mode that ranks by worst matchup first. With the default settings, it is only used after many unsuccessful generations.
 
 ---
 
