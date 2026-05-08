@@ -5,7 +5,7 @@
 # it under the terms of the GNU General Public License version 3 or
 # later as published by the Free Software Foundation.
 #
-# See the LICENSE file in the project root for details.
+# See the LICENSE.txt file in the project root for details.
 
 # Jacob Scow, a.k.a., RadiantDarkBlaze
 
@@ -2767,6 +2767,36 @@ def normalise(values: Sequence[float]) -> List[float]:
     return [float(v - worst) / denom for v in values]
 
 
+def composite_fitness_scores(
+    sum_margins: Sequence[float],
+    min_margins: Sequence[float],
+    *,
+    use_worst_only: bool = False,
+) -> List[float]:
+    """
+    Build GA fitness scores from normalised total-margin and worst-margin axes.
+
+    Usual mode keeps both total strength and weakest-matchup strength important,
+    while preserving a small signal floor on each axis.
+
+    Worst-only mode makes weakest-matchup strength dominant, with total margin
+    retained only as a tiny tie-breaker.
+    """
+    norm_sum = normalise(sum_margins)
+    norm_min = normalise(min_margins)
+
+    if use_worst_only:
+        return [
+            ((norm_sum[i] * 0.01) + 0.99) * ((norm_min[i] * 0.99) + 0.01)
+            for i in range(len(norm_sum))
+        ]
+
+    return [
+        ((norm_sum[i] * 0.99) + 0.01) * ((norm_min[i] * 0.99) + 0.01)
+        for i in range(len(norm_sum))
+    ]
+
+
 def evaluate_population_stage1(
     pop: List[Agent],
     opponents: List[Agent],
@@ -3010,18 +3040,11 @@ def refine_top_candidates(
             snapshot_stats_stage2[idx] = list(row)
 
         ordered_indices = list(top_indices)
-        if use_worst_only:
-            ordered_indices.sort(
-                key=lambda i: (final_min_margins.get(i, 0), final_sum_margins.get(i, 0), -i),
-                reverse=True,
-            )
-        else:
-            sums = [final_sum_margins[i] for i in ordered_indices]
-            mins = [final_min_margins[i] for i in ordered_indices]
-            N1 = normalise(sums)
-            N2 = normalise(mins)
-            fitness2 = {idx: N1[k] * N2[k] for k, idx in enumerate(ordered_indices)}
-            ordered_indices.sort(key=lambda i: (fitness2.get(i, 0.0), i), reverse=True)
+        sums = [final_sum_margins[i] for i in ordered_indices]
+        mins = [final_min_margins[i] for i in ordered_indices]
+        scores = composite_fitness_scores(sums, mins, use_worst_only=use_worst_only)
+        fitness2 = {idx: scores[k] for k, idx in enumerate(ordered_indices)}
+        ordered_indices.sort(key=lambda i: (fitness2.get(i, 0.0), i), reverse=True)
 
         return ordered_indices, final_sum_margins, final_min_margins, snapshot_stats_stage2
 
@@ -3170,18 +3193,11 @@ def refine_top_candidates(
             snapshot_stats_stage2[idx] = list(zip(row_m, row_d))
 
         ordered_indices = list(top_indices)
-        if use_worst_only:
-            ordered_indices.sort(
-                key=lambda i: (final_min_margins.get(i, 0), final_sum_margins.get(i, 0), -i),
-                reverse=True,
-            )
-        else:
-            sums = [final_sum_margins[i] for i in ordered_indices]
-            mins = [final_min_margins[i] for i in ordered_indices]
-            N1 = normalise(sums)
-            N2 = normalise(mins)
-            fitness2 = {idx: N1[k] * N2[k] for k, idx in enumerate(ordered_indices)}
-            ordered_indices.sort(key=lambda i: (fitness2.get(i, 0.0), i), reverse=True)
+        sums = [final_sum_margins[i] for i in ordered_indices]
+        mins = [final_min_margins[i] for i in ordered_indices]
+        scores = composite_fitness_scores(sums, mins, use_worst_only=use_worst_only)
+        fitness2 = {idx: scores[k] for k, idx in enumerate(ordered_indices)}
+        ordered_indices.sort(key=lambda i: (fitness2.get(i, 0.0), i), reverse=True)
 
         return ordered_indices, final_sum_margins, final_min_margins, snapshot_stats_stage2
 
@@ -3277,18 +3293,11 @@ def refine_top_candidates(
     if not ordered_indices:
         return ordered_indices, final_sum_margins, final_min_margins, snapshot_stats_stage2
 
-    if use_worst_only:
-        ordered_indices.sort(
-            key=lambda i: (final_min_margins.get(i, 0), final_sum_margins.get(i, 0), -i),
-            reverse=True,
-        )
-    else:
-        sums = [final_sum_margins[i] for i in ordered_indices]
-        mins = [final_min_margins[i] for i in ordered_indices]
-        N1 = normalise(sums)
-        N2 = normalise(mins)
-        fitness2 = {idx: N1[k] * N2[k] for k, idx in enumerate(ordered_indices)}
-        ordered_indices.sort(key=lambda i: (fitness2.get(i, 0.0), i), reverse=True)
+    sums = [final_sum_margins[i] for i in ordered_indices]
+    mins = [final_min_margins[i] for i in ordered_indices]
+    scores = composite_fitness_scores(sums, mins, use_worst_only=use_worst_only)
+    fitness2 = {idx: scores[k] for k, idx in enumerate(ordered_indices)}
+    ordered_indices.sort(key=lambda i: (fitness2.get(i, 0.0), i), reverse=True)
 
     return ordered_indices, final_sum_margins, final_min_margins, snapshot_stats_stage2
 
@@ -3415,13 +3424,11 @@ def train_population_once(
     )
 
     # Build Stage-1 fitness scores
-    if use_worst_only:
-        fitness_base_1 = normalise(min_margins_1)
-    else:
-        N1 = normalise(sum_margins_1)
-        N2 = normalise(min_margins_1)
-        raw = [N1[i] * N2[i] for i in range(n_candidates)]
-        fitness_base_1 = normalise(raw)
+    fitness_base_1 = composite_fitness_scores(
+        sum_margins_1,
+        min_margins_1,
+        use_worst_only=use_worst_only,
+    )
 
     indices = list(range(n_candidates))
     indices.sort(key=lambda i: (-fitness_base_1[i], i))
