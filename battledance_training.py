@@ -20,7 +20,7 @@ Implements a self-play training framework for the Battledance Chess variant:
 - Snapshot semantics: five slots per agent (_0.._4), active parents plus four retained opponent snapshots.
 - Per-cycle resumability via progress JSONs; per-agent champion evaluation logs.
 
-Licensed under GPL-3.0-or-later. See LICENSE.txt.
+Licensed under GPL-3.0-or-later. See LICENSE.
 """
 
 import os
