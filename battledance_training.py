@@ -70,10 +70,10 @@ STAGE1_ROUNDS: int = 2
 STAGE2_FINALISTS: int = 12
 STAGE2_ROUNDS: int = 16
 WORST_ONLY_EVERY_UNSUCCESSFUL_GENERATIONS: int = 1024
-MUTATION_RATE_SCHEDULE: List[Tuple[int, float]] = [(0, 1.0 / 256.0)]
+MUTATION_RATE_SCHEDULE: List[Tuple[int, float]] = [(0, 1.0 / 512.0)]
 WEIGHT_DECAY_SCHEDULE: List[Tuple[int, float]] = [(0, 0.0)]
-MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER: float = 0.5
-MUTATION_BIAS_NOISE_SCALE: float = 0.05
+MUTATION_WEIGHT_NOISE_SCALE_MULTIPLIER: float = 0.25
+MUTATION_BIAS_NOISE_SCALE: float = 0.03125
 MOVE_CHOICE_THRESHOLD: float = 0.8
 TERMINAL_WIN_SCORE: float = 1_000_000.0
 HIDDEN_LAYER_SIZES: Tuple[int, ...] = (512, 512, 512)
@@ -5306,7 +5306,7 @@ def update_cycle_counter(base_dir: str) -> int:
 #  Post-rotation cycle champion round-robin
 ###############################################################################
 
-CYCLE_CHAMPION_RR_REPS = 4
+CYCLE_CHAMPION_RR_REPS = 64
 
 
 def _cycle_rotation_done_path(base_dir: str, cycle: int) -> str:
@@ -5335,6 +5335,18 @@ def _cycle_champions_rr_moves_path(base_dir: str, cycle: int) -> str:
 
 def _cycle_champions_rr_matrix_path(base_dir: str, cycle: int) -> str:
     return _sample_game_path(base_dir, f"cycle_{int(cycle)}_matrix.txt")
+
+
+def _cycle_champions_rr_representatives_path(base_dir: str, cycle: int) -> str:
+    return _sample_game_path(base_dir, f"cycle_{int(cycle)}_champions_rr_representatives.txt")
+
+
+def _cycle_champions_rr_report_path(base_dir: str, cycle: int) -> str:
+    return _sample_game_path(base_dir, f"cycle_{int(cycle)}_champions_rr_report.txt")
+
+
+def _cycle_champions_rr_summary_json_path(base_dir: str, cycle: int) -> str:
+    return _sample_game_path(base_dir, f"cycle_{int(cycle)}_champions_rr_summary.json")
 
 
 def _rotation_done_snapshots_valid(agent_names: Sequence[str], base_dir: str) -> bool:
@@ -6167,6 +6179,379 @@ def _cycle_rr_matrix_text(
     return "\n".join(lines) + "\n"
 
 
+
+def _cycle_rr_result_label(result: int) -> str:
+    if int(result) > 0:
+        return "White win"
+    if int(result) < 0:
+        return "Black win"
+    return "Draw"
+
+
+def _cycle_rr_ply_count(moves_text: str) -> int:
+    return len(_tokenize_move_history_text(moves_text))
+
+
+def _cycle_rr_activity_count(moves_text: str) -> int:
+    tokens = _tokenize_move_history_text(moves_text)
+    return sum(1 for tok in tokens if "x" in tok or "@" in tok)
+
+
+def _cycle_rr_median_number(values: Sequence[int]) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(int(v) for v in values)
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return float(vals[mid])
+    return (float(vals[mid - 1]) + float(vals[mid])) / 2.0
+
+
+def _cycle_rr_result_count_matrices(
+    records: Sequence[Tuple[int, int, str, str]],
+    *,
+    n_agents: int,
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    """Return directed White-win, Black-win, and draw count matrices."""
+    n = int(n_agents)
+    white_wins = [[0 for _ in range(n)] for _ in range(n)]
+    black_wins = [[0 for _ in range(n)] for _ in range(n)]
+    draws = [[0 for _ in range(n)] for _ in range(n)]
+
+    for idx, result, _header, _moves in records:
+        _rep, white_idx, black_idx = _cycle_rr_global_index_to_game(int(idx), n)
+        if int(result) > 0:
+            white_wins[white_idx][black_idx] += 1
+        elif int(result) < 0:
+            black_wins[white_idx][black_idx] += 1
+        else:
+            draws[white_idx][black_idx] += 1
+
+    return white_wins, black_wins, draws
+
+
+def _cycle_rr_choose_representative_record(
+    records: Sequence[Tuple[int, int, str, str]],
+) -> Tuple[int, int, str, str]:
+    """Pick one representative game for a directed cell.
+
+    Result class policy:
+      1. choose the modal result class;
+      2. if tied, prefer Black win > White win > Draw;
+      3. therefore Draw is representative only when strictly modal.
+
+    Within that result class, choose the game closest to median ply count,
+    then closest to median capture/drop activity, then earliest global index.
+    """
+    if not records:
+        raise ValueError("Cannot choose a representative game from an empty record list.")
+
+    counts = {-1: 0, 1: 0, 0: 0}
+    for _idx, result, _header, _moves in records:
+        counts[int(result)] = counts.get(int(result), 0) + 1
+
+    # Tie priority intentionally encodes: Black win > White win > Draw.
+    tie_priority = {-1: 2, 1: 1, 0: 0}
+    chosen_result = max((-1, 1, 0), key=lambda r: (counts.get(r, 0), tie_priority[r]))
+    candidates = [rec for rec in records if int(rec[1]) == int(chosen_result)]
+    if not candidates:
+        # This should be unreachable, but keep deterministic fallback behaviour.
+        candidates = list(records)
+
+    median_plies = _cycle_rr_median_number([_cycle_rr_ply_count(moves) for _idx, _result, _header, moves in candidates])
+    median_activity = _cycle_rr_median_number([_cycle_rr_activity_count(moves) for _idx, _result, _header, moves in candidates])
+
+    return min(
+        candidates,
+        key=lambda rec: (
+            abs(_cycle_rr_ply_count(rec[3]) - median_plies),
+            abs(_cycle_rr_activity_count(rec[3]) - median_activity),
+            int(rec[0]),
+        ),
+    )
+
+
+def _cycle_rr_representatives_by_cell(
+    records: Sequence[Tuple[int, int, str, str]],
+    *,
+    n_agents: int,
+) -> Dict[Tuple[int, int], Tuple[int, int, str, str]]:
+    n = int(n_agents)
+    by_cell: Dict[Tuple[int, int], List[Tuple[int, int, str, str]]] = {}
+    for rec in records:
+        idx = int(rec[0])
+        _rep, white_idx, black_idx = _cycle_rr_global_index_to_game(idx, n)
+        by_cell.setdefault((white_idx, black_idx), []).append(rec)
+
+    representatives: Dict[Tuple[int, int], Tuple[int, int, str, str]] = {}
+    for white_idx in range(n):
+        for black_idx in range(n):
+            representatives[(white_idx, black_idx)] = _cycle_rr_choose_representative_record(
+                by_cell.get((white_idx, black_idx), [])
+            )
+    return representatives
+
+
+def _cycle_rr_agent_rankings(
+    *,
+    agent_names: Sequence[str],
+    matrix: Sequence[Sequence[int]],
+    white_wins: Sequence[Sequence[int]],
+    black_wins: Sequence[Sequence[int]],
+    draws: Sequence[Sequence[int]],
+) -> List[Dict[str, object]]:
+    """Build perspective-correct total rankings from a directed White-result matrix."""
+    n = len(agent_names)
+    rankings: List[Dict[str, object]] = []
+    for i, name in enumerate(agent_names):
+        as_white_margin = sum(int(matrix[i][c]) for c in range(n))
+        as_black_margin = -sum(int(matrix[r][i]) for r in range(n))
+        total_margin = as_white_margin + as_black_margin
+
+        wins_as_white = sum(int(white_wins[i][c]) for c in range(n))
+        losses_as_white = sum(int(black_wins[i][c]) for c in range(n))
+        draws_as_white = sum(int(draws[i][c]) for c in range(n))
+        wins_as_black = sum(int(black_wins[r][i]) for r in range(n))
+        losses_as_black = sum(int(white_wins[r][i]) for r in range(n))
+        draws_as_black = sum(int(draws[r][i]) for r in range(n))
+
+        wins = wins_as_white + wins_as_black
+        losses = losses_as_white + losses_as_black
+        draw_count = draws_as_white + draws_as_black
+        rankings.append({
+            "agent": str(name),
+            "index": int(i),
+            "total_margin": int(total_margin),
+            "as_white_margin": int(as_white_margin),
+            "as_black_margin": int(as_black_margin),
+            "color_margin_swing": int(as_white_margin - as_black_margin),
+            "wins": int(wins),
+            "losses": int(losses),
+            "draws": int(draw_count),
+            "wins_as_white": int(wins_as_white),
+            "losses_as_white": int(losses_as_white),
+            "draws_as_white": int(draws_as_white),
+            "wins_as_black": int(wins_as_black),
+            "losses_as_black": int(losses_as_black),
+            "draws_as_black": int(draws_as_black),
+        })
+
+    rankings.sort(
+        key=lambda row: (
+            int(row["total_margin"]),
+            int(row["wins"]),
+            -int(row["losses"]),
+            int(row["as_black_margin"]),
+            -int(row["index"]),
+        ),
+        reverse=True,
+    )
+    for rank, row in enumerate(rankings, start=1):
+        row["rank"] = int(rank)
+    return rankings
+
+
+def _cycle_rr_count_matrix_text(
+    *,
+    agent_names: Sequence[str],
+    white_wins: Sequence[Sequence[int]],
+    black_wins: Sequence[Sequence[int]],
+    draws: Sequence[Sequence[int]],
+) -> str:
+    label_width = max(5, max(len(str(x)) for x in agent_names) + 1)
+    cell_width = max(9, len("W/B/D"))
+    lines: List[str] = []
+    lines.append("Cell counts as W/B/D = White wins / Black wins / Draws.")
+    lines.append(
+        "White\\Black".ljust(label_width + 6)
+        + "".join(str(name).rjust(cell_width) for name in agent_names)
+    )
+    for r in range(len(agent_names)):
+        row_cells = []
+        for c in range(len(agent_names)):
+            row_cells.append(f"{int(white_wins[r][c])}/{int(black_wins[r][c])}/{int(draws[r][c])}".rjust(cell_width))
+        lines.append(str(agent_names[r]).ljust(label_width + 6) + "".join(row_cells))
+    return "\n".join(lines) + "\n"
+
+
+def _cycle_rr_report_text(
+    *,
+    cycle: int,
+    reps: int,
+    agent_names: Sequence[str],
+    matrix: Sequence[Sequence[int]],
+    white_wins: Sequence[Sequence[int]],
+    black_wins: Sequence[Sequence[int]],
+    draws: Sequence[Sequence[int]],
+    rankings: Sequence[Dict[str, object]],
+) -> str:
+    n = len(agent_names)
+    expected_games = int(reps) * n * n
+    lines: List[str] = []
+    lines.append(f"Cycle {int(cycle)} champion round-robin report")
+    lines.append(f"Agents: {n}")
+    lines.append(f"Reps per directed cell: {int(reps)}")
+    lines.append(f"Total games: {expected_games}")
+    lines.append("Rows = White _1 champion; columns = Black _1 champion.")
+    lines.append("Result margins are from White's perspective unless explicitly noted otherwise.")
+    lines.append("Representative-game policy: modal result; ties break Black win > White win > Draw; then median-ish length/activity.")
+    lines.append("")
+
+    lines.append("Rankings")
+    lines.append("--------")
+    lines.append("Rank Agent  Margin  W-L-D  AsW  AsB  Swing")
+    for row in rankings:
+        lines.append(
+            f"{int(row['rank']):>4} {str(row['agent']):<5} "
+            f"{int(row['total_margin']):+7d}  "
+            f"{int(row['wins'])}-{int(row['losses'])}-{int(row['draws'])}  "
+            f"{int(row['as_white_margin']):+4d} "
+            f"{int(row['as_black_margin']):+4d} "
+            f"{int(row['color_margin_swing']):+6d}"
+        )
+    lines.append("")
+
+    lines.append("Directed margin matrix")
+    lines.append("----------------------")
+    lines.append(_cycle_rr_matrix_text(cycle=cycle, reps=reps, agent_names=agent_names, matrix=matrix).rstrip())
+    lines.append("")
+
+    lines.append("Directed result-count matrix")
+    lines.append("----------------------------")
+    lines.append(_cycle_rr_count_matrix_text(
+        agent_names=agent_names,
+        white_wins=white_wins,
+        black_wins=black_wins,
+        draws=draws,
+    ).rstrip())
+    lines.append("")
+
+    directed_cells: List[Tuple[int, int, int]] = []
+    for r in range(n):
+        for c in range(n):
+            directed_cells.append((abs(int(matrix[r][c])), r, c))
+    directed_cells.sort(key=lambda x: (x[0], str(agent_names[x[1]]), str(agent_names[x[2]])), reverse=True)
+
+    lines.append("Most lopsided directed cells")
+    lines.append("----------------------------")
+    for _abs_margin, r, c in directed_cells[:min(20, len(directed_cells))]:
+        margin = int(matrix[r][c])
+        leader = str(agent_names[r]) if margin > 0 else (str(agent_names[c]) if margin < 0 else "split")
+        lines.append(
+            f"{str(agent_names[r])} as W vs {str(agent_names[c])} as B: "
+            f"margin {margin:+d}; W/B/D={int(white_wins[r][c])}/{int(black_wins[r][c])}/{int(draws[r][c])}; leader={leader}"
+        )
+    lines.append("")
+
+    skews: List[Tuple[int, int, int, int, int]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            i_as_white = int(matrix[i][j])
+            i_as_black = -int(matrix[j][i])
+            swing = i_as_white - i_as_black
+            skews.append((abs(swing), swing, i, j, i_as_white))
+    skews.sort(key=lambda x: (x[0], abs(x[4]), str(agent_names[x[2]]), str(agent_names[x[3]])), reverse=True)
+
+    lines.append("Largest color-direction swings")
+    lines.append("------------------------------")
+    for _abs_swing, swing, i, j, _i_as_white in skews[:min(20, len(skews))]:
+        i_as_white = int(matrix[i][j])
+        i_as_black = -int(matrix[j][i])
+        lines.append(
+            f"{str(agent_names[i])} vs {str(agent_names[j])}: "
+            f"{str(agent_names[i])} as W {i_as_white:+d}, as B {i_as_black:+d}, swing {int(swing):+d}"
+        )
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _cycle_rr_representatives_text(
+    *,
+    cycle: int,
+    reps: int,
+    agent_names: Sequence[str],
+    representatives: Dict[Tuple[int, int], Tuple[int, int, str, str]],
+    white_wins: Sequence[Sequence[int]],
+    black_wins: Sequence[Sequence[int]],
+    draws: Sequence[Sequence[int]],
+) -> str:
+    n = len(agent_names)
+    lines: List[str] = []
+    lines.append(f"Cycle {int(cycle)} champion round-robin representative games")
+    lines.append(f"One representative game per directed cell ({n} x {n} = {n * n} games shown).")
+    lines.append(f"Underlying sample: {int(reps)} reps per directed cell.")
+    lines.append("Selection: modal result; ties break Black win > White win > Draw; then median-ish ply count, capture/drop activity, earliest index.")
+    lines.append("")
+
+    for white_idx in range(n):
+        for black_idx in range(n):
+            idx, result, header, moves = representatives[(white_idx, black_idx)]
+            parsed = _cycle_rr_parse_header_fields(header) or {}
+            rep = int(parsed.get("rep", 0) or 0)
+            lines.append(
+                f"=== {str(agent_names[white_idx])} as White vs {str(agent_names[black_idx])} as Black ==="
+            )
+            lines.append(
+                f"Cell over {int(reps)} reps: "
+                f"White wins {int(white_wins[white_idx][black_idx])}, "
+                f"Black wins {int(black_wins[white_idx][black_idx])}, "
+                f"Draws {int(draws[white_idx][black_idx])}."
+            )
+            lines.append(
+                f"Representative: index {int(idx)}, rep {rep}, {_cycle_rr_result_label(int(result))}, "
+                f"plies {_cycle_rr_ply_count(moves)}, captures/drops {_cycle_rr_activity_count(moves)}."
+            )
+            lines.append(header)
+            if moves:
+                lines.append(moves)
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _cycle_rr_summary_json_payload(
+    *,
+    cycle: int,
+    reps: int,
+    agent_names: Sequence[str],
+    matrix: Sequence[Sequence[int]],
+    white_wins: Sequence[Sequence[int]],
+    black_wins: Sequence[Sequence[int]],
+    draws: Sequence[Sequence[int]],
+    rankings: Sequence[Dict[str, object]],
+    representatives: Dict[Tuple[int, int], Tuple[int, int, str, str]],
+) -> Dict[str, object]:
+    n = len(agent_names)
+    reps_payload: Dict[str, object] = {}
+    for (white_idx, black_idx), (idx, result, header, moves) in sorted(representatives.items()):
+        key = f"{str(agent_names[white_idx])}|{str(agent_names[black_idx])}"
+        reps_payload[key] = {
+            "white": str(agent_names[white_idx]),
+            "black": str(agent_names[black_idx]),
+            "index": int(idx),
+            "rep": int((_cycle_rr_parse_header_fields(header) or {}).get("rep", 0) or 0),
+            "result": _result_to_log_text(result),
+            "result_label": _cycle_rr_result_label(int(result)),
+            "ply_count": int(_cycle_rr_ply_count(moves)),
+            "capture_drop_count": int(_cycle_rr_activity_count(moves)),
+        }
+    return {
+        "kind": "cycle_champions_rr_summary",
+        "cycle": int(cycle),
+        "reps": int(reps),
+        "games": int(reps) * n * n,
+        "agent_names": [str(x) for x in agent_names],
+        "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
+        "matrix_white_perspective_margin": [[int(x) for x in row] for row in matrix],
+        "white_win_counts": [[int(x) for x in row] for row in white_wins],
+        "black_win_counts": [[int(x) for x in row] for row in black_wins],
+        "draw_counts": [[int(x) for x in row] for row in draws],
+        "rankings": list(rankings),
+        "representatives": reps_payload,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+
+
 def _cycle_rr_final_outputs_valid(
     *,
     base_dir: str,
@@ -6188,7 +6573,22 @@ def _cycle_rr_final_outputs_valid(
 
     moves_path = _cycle_champions_rr_moves_path(base_dir, cycle)
     matrix_path = _cycle_champions_rr_matrix_path(base_dir, cycle)
-    if not os.path.exists(moves_path) or not os.path.exists(matrix_path):
+    representatives_path = _cycle_champions_rr_representatives_path(base_dir, cycle)
+    report_path = _cycle_champions_rr_report_path(base_dir, cycle)
+    summary_path = _cycle_champions_rr_summary_json_path(base_dir, cycle)
+    required_paths = [moves_path, matrix_path, representatives_path, report_path, summary_path]
+    if not all(os.path.exists(path) for path in required_paths):
+        return False
+
+    summary = _safe_read_json(summary_path)
+    if not (
+        isinstance(summary, dict)
+        and summary.get("kind") == "cycle_champions_rr_summary"
+        and summary.get("cycle") == int(cycle)
+        and summary.get("reps") == int(reps)
+        and summary.get("games") == int(expected_games)
+        and summary.get("agent_names_sha1") == _cycle_rr_names_sha1(agent_names)
+    ):
         return False
 
     n = len(agent_names)
@@ -6213,6 +6613,7 @@ def _cycle_rr_final_outputs_valid(
         return False
     return matrix_text == _cycle_rr_matrix_text(cycle=cycle, reps=reps, agent_names=agent_names, matrix=matrix_from_logs)
 
+
 def _cycle_rr_finalize_outputs(
     *,
     base_dir: str,
@@ -6222,18 +6623,11 @@ def _cycle_rr_finalize_outputs(
     agent_names: Sequence[str],
     matrix: List[List[int]],
 ) -> None:
-    records: List[Tuple[int, str, str]] = []
+    records: List[Tuple[int, int, str, str]] = []
     for worker_id, _ in enumerate(chunks, start=1):
         path = _cycle_champions_rr_worker_log_path(base_dir, cycle, worker_id)
-        lines: List[str] = []
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    lines = f.read().splitlines()
-            except Exception:
-                lines = []
-        for idx, _result, header, moves in _cycle_rr_read_worker_log_records(path):
-            records.append((int(idx), header, moves))
+        for idx, result, header, moves in _cycle_rr_read_worker_log_records(path):
+            records.append((int(idx), int(result), header, moves))
 
     records.sort(key=lambda x: x[0])
     expected_games = int(reps) * len(agent_names) * len(agent_names)
@@ -6244,7 +6638,7 @@ def _cycle_rr_finalize_outputs(
 
     n = len(agent_names)
     matrix_from_logs = [[0 for _ in range(n)] for _ in range(n)]
-    for expected_idx, (idx, header, _moves) in enumerate(records):
+    for expected_idx, (idx, result, header, _moves) in enumerate(records):
         if idx != expected_idx:
             raise RuntimeError(
                 f"Cycle {cycle} RR logged game indices are not exactly 0..{expected_games - 1}; "
@@ -6252,7 +6646,6 @@ def _cycle_rr_finalize_outputs(
             )
         if not _cycle_rr_header_matches_schedule(header, cycle=cycle, reps=reps, agent_names=agent_names):
             raise RuntimeError(f"Cycle {cycle} RR header does not match expected schedule at index {idx}: {header!r}")
-        result = _cycle_rr_parse_log_result(header)
         _rep, white_idx, black_idx = _cycle_rr_global_index_to_game(idx, n)
         matrix_from_logs[white_idx][black_idx] += int(result)
 
@@ -6264,14 +6657,73 @@ def _cycle_rr_finalize_outputs(
         )
     matrix = matrix_from_logs
 
+    white_wins, black_wins, draws = _cycle_rr_result_count_matrices(records, n_agents=n)
+    rankings = _cycle_rr_agent_rankings(
+        agent_names=agent_names,
+        matrix=matrix,
+        white_wins=white_wins,
+        black_wins=black_wins,
+        draws=draws,
+    )
+    representatives = _cycle_rr_representatives_by_cell(records, n_agents=n)
+
     moves_path = _cycle_champions_rr_moves_path(base_dir, cycle)
-    moves_text = _write_game_records_text([(header, moves) for _, header, moves in records])
+    moves_text = _write_game_records_text([(header, moves) for _idx, _result, header, moves in records])
     _safe_write_text(moves_path, moves_text, durable=True)
 
     matrix_path = _cycle_champions_rr_matrix_path(base_dir, cycle)
     _safe_write_text(
         matrix_path,
         _cycle_rr_matrix_text(cycle=cycle, reps=reps, agent_names=agent_names, matrix=matrix),
+        durable=True,
+    )
+
+    representatives_path = _cycle_champions_rr_representatives_path(base_dir, cycle)
+    _safe_write_text(
+        representatives_path,
+        _cycle_rr_representatives_text(
+            cycle=cycle,
+            reps=reps,
+            agent_names=agent_names,
+            representatives=representatives,
+            white_wins=white_wins,
+            black_wins=black_wins,
+            draws=draws,
+        ),
+        durable=True,
+    )
+
+    report_path = _cycle_champions_rr_report_path(base_dir, cycle)
+    _safe_write_text(
+        report_path,
+        _cycle_rr_report_text(
+            cycle=cycle,
+            reps=reps,
+            agent_names=agent_names,
+            matrix=matrix,
+            white_wins=white_wins,
+            black_wins=black_wins,
+            draws=draws,
+            rankings=rankings,
+        ),
+        durable=True,
+    )
+
+    summary_path = _cycle_champions_rr_summary_json_path(base_dir, cycle)
+    _safe_write_json(
+        summary_path,
+        _cycle_rr_summary_json_payload(
+            cycle=cycle,
+            reps=reps,
+            agent_names=agent_names,
+            matrix=matrix,
+            white_wins=white_wins,
+            black_wins=black_wins,
+            draws=draws,
+            rankings=rankings,
+            representatives=representatives,
+        ),
+        indent=2,
         durable=True,
     )
 
@@ -6283,12 +6735,20 @@ def _cycle_rr_finalize_outputs(
         "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
         "moves_file": os.path.basename(moves_path),
         "matrix_file": os.path.basename(matrix_path),
+        "representatives_file": os.path.basename(representatives_path),
+        "report_file": os.path.basename(report_path),
+        "summary_json_file": os.path.basename(summary_path),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
     _safe_write_json(_cycle_champions_rr_done_path(base_dir, cycle), done_payload, indent=2, durable=True)
     if not _cycle_rr_final_outputs_valid(base_dir=base_dir, cycle=cycle, reps=reps, agent_names=agent_names):
         raise RuntimeError(f"Cycle {cycle} RR final output verification failed after writing done marker.")
-    log(f"[cycle {cycle} RR] finalized {expected_games} games to {os.path.basename(moves_path)} and {os.path.basename(matrix_path)}.")
+    log(
+        f"[cycle {cycle} RR] finalized {expected_games} games to "
+        f"{os.path.basename(moves_path)}, {os.path.basename(matrix_path)}, "
+        f"{os.path.basename(representatives_path)}, {os.path.basename(report_path)}, "
+        f"and {os.path.basename(summary_path)}."
+    )
 
 def run_cycle_champions_round_robin(
     agent_names: List[str],
@@ -6304,8 +6764,11 @@ def run_cycle_champions_round_robin(
     the newly minted `_1` champions for this cycle.
 
     Outputs:
-      * cycle_n_champions_rr.txt  -- two lines per game: header + move list
-      * cycle_n_matrix.txt        -- directed result-margin matrix
+      * cycle_n_champions_rr.txt                  -- full raw game log
+      * cycle_n_matrix.txt                        -- directed result-margin matrix
+      * cycle_n_champions_rr_representatives.txt  -- one representative game per directed cell
+      * cycle_n_champions_rr_report.txt           -- rankings, count matrices, lopsided/color-skew summaries
+      * cycle_n_champions_rr_summary.json         -- machine-readable aggregate data
 
     Resume files:
       * cycle_n_champions_rr_progress_worker_##.json
