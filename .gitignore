@@ -4,6 +4,7 @@ sample_games/
 __pycache__/
 *.pyc
 *.tmp.*
+*.bdpop
 
 # Legacy unsafe model snapshots; convert to .bdpop instead.
 *.pkl
