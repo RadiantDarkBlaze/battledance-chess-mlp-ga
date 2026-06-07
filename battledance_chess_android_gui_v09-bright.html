@@ -1,0 +1,944 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Battledance Chess GUI v09-bright</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #111216;
+  --panel: #1b1d24;
+  --panel-2: #242733;
+  --text: #f2f2f2;
+  --muted: #b8bdc9;
+  --accent: #9fb7ff;
+  --danger: #ffb0b0;
+  --ok: #b5f2c0;
+  --warn: #ffe1a3;
+  --touch: 44px;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { min-height: 100svh; padding: env(safe-area-inset-top) 10px env(safe-area-inset-bottom); }
+header { display: none; }
+h1 { font-size: clamp(1.15rem, 4vw, 1.7rem); margin: 0 0 4px; letter-spacing: 0.01em; }
+.subline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 0.92rem; }
+.pill { background: #0f1015; border: 1px solid #343746; border-radius: 999px; padding: 3px 8px; }
+main { max-width: 680px; margin: 0 auto 24px; display: block; }
+@media (max-width: 820px) { body { padding-left: 6px; padding-right: 6px; } }
+.playSurface { display: grid; gap: 8px; }
+.card { background: var(--panel); border: 1px solid #303443; border-radius: 16px; padding: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.22); }
+.board-card { order: 1; padding: 6px; }
+.playerPanel { background: var(--panel); border: 1px solid #303443; border-radius: 16px; padding: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+.playerPanelInner { display: grid; gap: 6px; }
+.playerPanelTop { order: 0; transform: rotate(180deg); }
+.playerPanelBottom { order: 2; transform: none; }
+.playerTopLine { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; color: var(--muted); font-size: .92rem; }
+.playerTitle { font-weight: 800; color: var(--text); letter-spacing: .02em; }
+.playerTurn { font-weight: 700; }
+.playerHand { display: grid; grid-template-columns: 34px repeat(7, minmax(36px, 1fr)); gap: 5px; align-items: center; }
+.playerStatus { min-height: 46px; font-size: .92rem; }
+.twoPlayerControls { order: 3; margin-top: 2px; }
+#boardWrap {
+  width: min(100%, 640px);
+  aspect-ratio: 1 / 1;
+  margin: 0 auto;
+  position: relative;
+  background-image: var(--board-image);
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+  touch-action: manipulation;
+  user-select: none;
+  border-radius: 4px;
+  overflow: hidden;
+}
+#pieceLayer, #buttonLayer, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+.squareBtn {
+  position: absolute;
+  width: 10%; height: 10%;
+  border: 0; margin: 0; padding: 0;
+  background: transparent;
+  color: transparent;
+  -webkit-tap-highlight-color: transparent;
+}
+.pieceImg {
+  position: absolute;
+  width: 10%; height: 10%;
+  image-rendering: pixelated;
+  pointer-events: none;
+  user-select: none;
+}
+#overlay { pointer-events: none; }
+.controls { display: grid; gap: 10px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+button, .fileLabel {
+  min-height: var(--touch);
+  border: 1px solid #3a4052;
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 8px 11px;
+  font: inherit;
+  font-weight: 650;
+}
+button:active, .fileLabel:active { transform: translateY(1px); }
+button[disabled] { opacity: .45; }
+.primary { background: #26304e; border-color: #52629b; }
+.warn { background: #3a2d19; border-color: #6e5428; }
+.danger { background: #3b2026; border-color: #74414b; }
+.fileLabel input { display: none; }
+.statusBox { background: #101218; border: 1px solid #303443; border-radius: 12px; padding: 9px; line-height: 1.35; }
+.statusBox strong { color: var(--accent); }
+.small { font-size: 0.88rem; color: var(--muted); }
+.hands { display: grid; gap: 8px; }
+.handRow { display: grid; grid-template-columns: 42px repeat(7, minmax(40px,1fr)); gap: 6px; align-items: center; }
+.handLabel { color: var(--muted); font-weight: 700; }
+.handBtn { min-width: 0; padding: 5px 3px; display: grid; place-items: center; gap: 2px; min-height: 48px; }
+.handBtn.selected { outline: 3px solid #d6deff; outline-offset: 1px; }
+.handBtn img { width: 28px; height: 28px; image-rendering: pixelated; }
+.handCount { font-size: .78rem; color: var(--muted); }
+textarea { width: 100%; min-height: 130px; resize: vertical; border-radius: 12px; border: 1px solid #3a4052; background: #0f1117; color: var(--text); padding: 9px; font: 0.86rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+#pasteArea { min-height: 105px; }
+.details { display: grid; gap: 8px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+@media (max-width: 420px) { .grid2 { grid-template-columns: 1fr; } }
+.note { color: var(--muted); font-size: .86rem; line-height: 1.35; }
+.legendLine { display: flex; flex-wrap: wrap; gap: 5px 10px; color: var(--muted); font-size: .84rem; }
+.kbd { border: 1px solid #42485c; background:#101218; border-radius: 6px; padding: 1px 5px; color: #e7e9ef; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Battledance Chess GUI v09-bright</h1>
+  <div class="subline">
+    <span class="pill" id="turnPill">Turn: White</span>
+    <span class="pill" id="plyPill">Ply: 0</span>
+    <span class="pill" id="viewPill">Live board</span>
+  </div>
+</header>
+<main>
+  <section class="playSurface">
+    <section id="blackPanel" class="playerPanel playerPanelTop" aria-label="Black player panel">
+      <div class="playerPanelInner">
+        <div class="playerTopLine">
+          <span class="playerTitle">Black</span>
+          <span class="playerTurn" id="blackTurnLine">Waiting</span>
+        </div>
+        <div class="statusBox playerStatus" id="blackStatusBox"><strong>Black.</strong> Waiting.</div>
+        <div class="playerHand" id="blackHand"></div>
+      </div>
+    </section>
+
+    <section class="card board-card">
+      <div id="boardWrap" aria-label="Battledance Chess board">
+        <div id="pieceLayer"></div>
+        <svg id="overlay" viewBox="0 0 640 640" preserveAspectRatio="none"></svg>
+        <div id="buttonLayer"></div>
+      </div>
+    </section>
+
+    <section id="whitePanel" class="playerPanel playerPanelBottom" aria-label="White player panel">
+      <div class="playerPanelInner">
+        <div class="playerTopLine">
+          <span class="playerTitle">White</span>
+          <span class="playerTurn" id="whiteTurnLine">To move</span>
+        </div>
+        <div class="statusBox playerStatus" id="whiteStatusBox"><strong>White to move.</strong> Tap a piece or hand piece.</div>
+        <div class="playerHand" id="whiteHand"></div>
+      </div>
+    </section>
+
+    <section class="card controls twoPlayerControls">
+      <div class="row">
+        <button id="newBtn" class="danger">New</button>
+        <button id="flipBtn">Flip</button>
+        <button id="prevBtn">◀</button>
+        <button id="nextBtn">▶</button>
+        <button id="undoBtn" class="warn">Undo</button>
+      </div>
+      <div class="grid2">
+        <button id="copyBtn" class="primary">Copy log</button>
+        <button id="exportBtn">Export JSON</button>
+      </div>
+      <label class="fileLabel">Import JSON <input id="fileInput" type="file" accept="application/json,.json" /></label>
+      <div class="details">
+        <textarea id="logText" readonly spellcheck="false" aria-label="Move log"></textarea>
+        <textarea id="pasteArea" spellcheck="false" placeholder="Paste a Battledance move log here, then tap Load pasted log."></textarea>
+        <div class="grid2">
+          <button id="loadPasteBtn">Load pasted log</button>
+          <button id="loadSampleBtn">Load sample</button>
+        </div>
+      </div>
+      <div class="note">
+        Tabletop portrait mode: the far-side player panel is above the board and rotated; Flip swaps which player is on the far side. Board coordinate graphics are unchanged. Legal targets use piece-colored square highlights; blocked geometry uses dotted outlines. Checked Bishops get a colored center box plus corner brackets. Last move squares get a 4px source-pixel box: <span class="kbd">#cccccc</span> after White moves, <span class="kbd">#000000</span> after Black moves.
+      </div>
+      <div class="legendLine">
+        <span><span class="kbd">□</span> checked bishop marker</span>
+        <span><span class="kbd">#</span> no legal move / bishop capture</span>
+        <span><span class="kbd">=</span> draw</span>
+      </div>
+    </section>
+  </section>
+</main>
+<script>
+'use strict';
+const ASSETS = {"W_P":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAABmZmaIiIiqIkSqqqrMzMyzrsSOAAAA3UlEQVR42u2VTQrCMBBGX9rZSy8gZU7gEby5G2/gPmgvUOlaiwurtJPpj7hRNDCEMMkk38tHEgqmm8gWgMu+63dnAMKq67OZAnzChDArs6AAopNSoEbug3zD9WCieZ5B1a+uCgjQVv6EtloqMytHcmW3RRxZHAGCzsgMSj1xggLxGTzixHf4YYFMC2cIzXBojDdSDok3xPPAWzITb4jngQkOVuaAg3YxLNTj0PRW5i4HVYjRsBDDIFsbFi9xyEpoj4aFGAbJdfY4aC8fPQ7Rhfl7fnAL/ND7oP//ouYGtYqMotFT5K0AAAAASUVORK5CYII=","W_F":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAABEqiJmZmaIiIiqqqrMzMxnHfiJAAAA6ElEQVR42uWVvQrCMBSFv9b7AsFdxCcQujo49LE7OLjq4l7EFyjda3FJ05tb+gMuSgMhOSQk+Q4nSXJgusjmCMD74dv7E4B059t0ZgF+YUIyi+molKwAp7RDIN3TvnytiHU9OEOe2y2Mbq7fYsp5Zoti4EM2j6kH3GCi98Hyd7r3wfIHLSP8QS/2wfIHLSP8hfHB8vfY0hkSF6et1vy21vzHvYjzwABXYpMy4BaZ5Y3qvND9KpxBZ6EoTCbEZEFOJhOLMHUWmovJhJgs5DYTnqItgRK2qr/cqJXkgYmLs9b3wb6XrOW/+AAwIpMHC4/M8wAAAABJRU5ErkJggg==","W_K":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAiRKpmZmaIiIiqqqrMzMw5haqpAAAA4ElEQVR42uXVMQ6CQBCF4V+cCxB7YzyBCa2FBcemsLDFxp4YL0DskVjIIjMsrMZGZROyDDuBvC/AztaMD5lvALidmvl4BiBaNnMUuAHf0DALxowpR5ZjBKIV9WXguPIbDkk4ZneUQKyhtEOJrvsOaWqpTV0dPo0pu8AjsoCDjakc3KJu6jg4g66FdnAGykI8BsriLQdnoCzEY5ANOPhitg7uYgLkqkl0dozF08FlzzJjIcZAtsbiZQeXvdobCzHZU2shUBeP07qABbpuHRxQPvH3Ae83Mc3/Az0Dj8O/7hd36bGUnsVSj2QAAAAASUVORK5CYII=","W_N":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAAiGZmZmaIiIiqqqrMzMx2pKHfAAAA3UlEQVR42u2VMQ6CMBSGP7AX6AUM8QQmrA4OHJuBwRUXL2C4AHFH4mALfS1QjYsGm5Cfn5KW/+M9SHYsD7XZA3C/GD1fAUi3RtPIAnzDDUk0pqZdmNYoSDP6Zua48Rsc8nhMO1pAO2pAjRxanudWQw5FIdWuMIzuJPX9mOooNdii9NTnMBVz4CAvul6F2V0mIweR3fWKieyuf5mDyO56NZXd9YaDfMWjHzjYyRyo5+qhyejxeIR9UfoPo3x/+LTsuyqyRRHpCxuTuXqo8etjffXw/z7I3tB+ya3hf/EALTuRft/z4+wAAAAASUVORK5CYII=","W_G":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAABmAIhmZmaIiIiqqqrMzMzyNTLjAAAA6UlEQVR42uWVvQrCMBRGT+t9gb6AiE8gdHVw6GM7OLjWxV3EFwjdqzg0Cb230QguSgvh8uX/O71JijXvP1lsALiffTxdASiXPpaZCfiFDkXWZoUDHFCNqoOuEChXPBxDvPkSdBf30DR65qjFx/6oO0T9sU3Zmc3vzBJ7MzDqos7btI147UIHDIMxi2GTloFiIQkGisVHHCwDxUISDBSLouaSsBlYrJF0I3GQpBmE0vEf52LIB15aFV1RA63mrTnY3Jhy2NsfI1Zvv7XZHzJLNBkO1uaEQzvNu9nkg3tzcOZ2P7y6SJnLe/EEx3mPHNIXBMcAAAAASUVORK5CYII=","W_L":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAABmZmaIZgCIiIiqqqrMzMyvCKFEAAAA5klEQVR42uWVQQqDMBBFX2r2JVdwXwjkAl302IVuuhUK7gs9gcV1A11EbTKKsXTT1gH5AcWZ/+ehyjBfWu8BeJw7Pd0BUNtON5kX8A0PqKzNkmt3NEATKUCJhsLia4u/Ec691hbfJjM4l2poEZ19ner7Ngub6qhFJTTk4PI2+2qEDi16z1NXy2/w8Mphqkp0GkxcJo56KovbMEOyf8mHlvuXfCyymexf8qHl/iUfytHM2DTo9OYBOEZcGMmDzGTMQyUH0nLy3afr9pdMC5fhIbYZeFgS1Ap5iGuShz/+PjDzIWUt/4snAZ2S+usuyiwAAAAASUVORK5CYII=","W_R":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAD1BMVEUAAABmZmaIiIiqqqrMzMzHvaunAAAAnElEQVR42u2UQQrDIBBFn4nbkHqDkAs0979EC9130e6jHiC1G6FOhJhFFw1VkOGhfvhfHWXYHrqdAFhusV4cAKqPtSkI8AsbVNGmwSbYTizXhA0amoHXI85n8F3KnmPkMEqbZ99Jm0WFdQ5IrjkcOofs2e9RGDeW75mCtXmSwX30TqoXzK67EB88OJPyjF4dMN/PofaH2h/+sD+8Aff0djMx1RkkAAAAAElFTkSuQmCC","W_B":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAD1BMVEUAAABmZmaIiIiqqqrMzMzHvaunAAAByElEQVR42s2VQU7DMBBF/0wqFRZo7Bu0vQBB3P8IiErsWXCB2N0VqZhFHGdmHIHEikpRFx21z89+LkX8/NoNIwDg9lbfXxMAgKS+8y9fgP8wQL8uM+KE23nzs2HEO3ZASfHwccBX94wTzQwxhc1fL3GBlGFrYMx1FZQojRsEJZQAMHAWCPUDISPfAAYKJeopqIQSEkAnTMMjFXpxA88ppIdzBAO4bVAMJZRwBjBEfB6vQnveX45R2vOU7/L+Xq7zMnuKhWDZrCTOxZiRi9pNT9EI2nY7F9WBGrAUK8HsAQCMi9kBAMR2ojSFIqgeoly0i+rgcoyLB0uhCfShbS5WB3ZgoTAE5thXF8qBG5gpLMHqoblAc2A9NApLAOwAbi0kgeSQ5dTayLbNQoksgY83CbSDP+QfMnwj7E9idzqVBzynkMQ0Yj0MJZTgG9EexhSyZIHQYdPDvAu+Ee5acI1w14JrhPsWbCPct+AaWTysLehGVg/6JBqKpQvVgm6kdWFPoqZgfx/4+4L7Gi0F+/vA3xfcE7hST5i0A9PIS/XgCQzFEPFpHETj4greItAU3DlwLhjYIGgUdZnWgXJRPUw9wUwxzR5+/lv8BoIRPWmLiMR2AAAAAElFTkSuQmCC","B_P":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAiIiJERERmZmaqIkTMzMxWpkXoAAAA6UlEQVR42uWVQQ6CMBBFHzh70wsY070b3bpwwbG7YOEBPIExXqAXQOLCamAYisaNBpKmoUN/+Y+fodiRv+R2AmCxSfN2DUB7TXM5IcAvPFBM2ox4IBolB5yRx017oVyp4V7vEIKtHgIggOxHjt+/a7Op7VpTpyOqkc0VQOGnbcYRgce62AyeY8l/5MHjMuX4/NxdOH0uioNT2RhyGGRDrAx8ZXOQDbEykOGgbfY4OCAkkWhx6Cq1JocQoKoUC1EMmqNi8RGHpgY5KBaiGATNQqD0gFfCaS2+BWpmecBsJPPpDy7TSONc/hd3XoByvRN3RkEAAAAASUVORK5CYII=","B_F":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAiIiJEREREqiJmZmbMzMymjqssAAAA8klEQVR42uWVvwrCMBjErzaLi5gnKHQvCFldhD62gy9QKLj3FYJbB4sOJvHLhf4BF7WBkB4NX3I/LklWY7qp++U1Ht142gMAHjc3bmYK4BsmZHM2c1gtpO37fit0ZxUwtMgr1wvEepfsoWmYJC9ZfWpzaGeWMAmHEqW0CUDa7nwF/0MnEx0H9u/1mwP7D1qN+A96MQf2H7Qa8W+IA/v3OnDQVEBL1NI/9x1+41zEeeDWQcWQzgBqASug9izkdxH2ILNgDGVCURaGK2VikU2ZhfxAmVCUhYYzkZVR3NmmXQRqJXnAxMFZ6/3A92VyP/zre/EEcgJ9Uqmx+dEAAAAASUVORK5CYII=","B_K":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAiIiIiRKpERERmZmbMzMw29hGKAAAA10lEQVR42uXVsQ6CMBAG4B+82egLoOnu5OpC0sd24BF8gsb4AsRd0cEe9s6Walw0bUIu0Evh/wK0spgedOkededruwAA3M6+1pkF8AsNVTZmj+XEdA8CrgfMNoljhf9w2OZjhsMBMBJKOswhz18dnNPU+qGbb2MOx8wtTMZBxxQOPCmbAgc2CC2kAxsIC4oYCIuPHNhAWFDEwCQcYjFHB764B2BFE8nsUBZPB85ujLIgZTCclMXbDpy9XisLUtmdtvAOqZijAwPZwt8HRL+JMv8P0QVK2S/uEw18a1iQThEAAAAASUVORK5CYII=","B_N":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAAiGYiIiJERERmZmbMzMy6Ej2XAAAA20lEQVR42uWVTQ6CMBBGH2T2wAVccAW2bkw4tgsvwB28gKnsjXUBDdMfKcaNhibN10mbtu/LTFv0rDd5XCY9znqqAbDjrGVmA35hQZHFNDQr0waB55Xy8KZX/IcPXR7TtQHolM5GLT7ANHYa+2CMr26H5T6Vr59j2ruv0RFNoG5B2QIt3JjGTmmVD5rd90Jidu3J4oPHrmMhwa7jzT547DqWFLuOJWbXnpgwYc5Av1YXoR9xXTThZSSI7fht2hd15giTqYskps6HnjA/dpIPEtfCLt+HLQ/pHv6LFw1RgK/M81dfAAAAAElFTkSuQmCC","B_G":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAiIiJERERmAIhmZmbMzMzS33ZtAAAA6klEQVR42uWVzQrCMAzH/7U5D/cEwu4DYVcvgo/twRcYDLzvFYp3hx76sSbr1okXZYES0nZN82uSqQuWhZ43q09On/cAgNfD6V3mAPzCBpULU1WoABgAZTTt7R4EDB30AVbXbni7CHdoW35ysMlpXfMNwV4d5tDx+WB7F434sPkkTLkIZ5vYRcwgZmEvKRkwFpRgwFis4iAZMBaUYMBYqAplIkzPwoDSiyMLSjPwo8B/1IXNhznpQ0Y5uQLgpSQ4yNyYcmjkw5B8wfu3YepjxkWb4SDDnHCYtpPt5INZKJyt9Ye5Rmq28r94A0YFdtkKDsugAAAAAElFTkSuQmCC","B_L":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAElBMVEUAAAAiIiJERERmZmaIZgDMzMylx9A2AAAA5UlEQVR42u2VPQ6CQBCFP9btyV6AGHobaS0sODaFha2JJzDEC3ABJRb8uDNsWI2NBifZvCFLmHlvHrtJwXzY+xmA1abH7RqA9tqjiXyAb3ghidJscH3qgMZDgAYLbY3JaoyjywfMakwqeqgqiV0JP99JfJ/m7SBxUqJU2OmQx2kyPkgcSwycQyvlN/zw1CEUDVYK44fzhQpp4cYexPy1P6yev/bHSzTF/LU/rJ6/9keSk8/QvGDl5gkohC+UH7QmUz+UuiGrOz9+Om67j5SoIn7waQb9UPz9EPhplnU+MHOQspT74gG6EHsTvajkBAAAAABJRU5ErkJggg==","B_R":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAD1BMVEUAAAAiIiJERERmZmbMzMwLCzfvAAAAnElEQVR42u2UsQrDIBRFj4m72r0dshda8v//kP5A6R/YkDm1i5RnhJihQ0MV5HFQL76rXNWzPvQ8ANCeY71aAMIYa1MQ4Bc2qGKbHidwHmgvgj0aXg+aU5xHZSbJhn340KVt3syUtllUWPpAytWHXfuQffstCveV5S5TcC53UtkPhWcYE2bTWwQv72S95AN6ccB/34eaDzUf/jAf3sEVYo9UZU4xAAAAAElFTkSuQmCC","B_B":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABABAMAAABYR2ztAAAAD1BMVEUAAAAiIiJERERmZmbMzMwLCzfvAAAByklEQVR42s2VzWrrMBBGv5EDzSoav8BdZF9I6fs/QsH3BZq8gTR00R9wdBeW5ZmRaaGrGzBZRJijozkKPeP7z2GeAADDY/1+YgBAkfodfngB/ocF9OM2E14xXHZ/myeccQCI0+3PDaF7prEsDInz3gsKpRVS5r0FU6y7KFx42iGgTBkIwEUgpV+QI+IABIAKl56iUKbMAJ0xzn8LFe/jhTO/XRICgGGHYqZM+QJgGPFwPQo+71+na5L2TPzBn+9yXLbZU6wE62GxOBdTRCR1mp6iEbTjdi6qA7XAUmwEiwcAMC4WBwCQ2kRpCkVQPSQ5aRfVwemaVg+WQhPooW0uNgd2wUphCMzYVxfKgVuwUFiCzUNzgebAemgUlgA4APfWAgsk5iivrY1o26TCxRL4eFmgHfwi/xzhGwl+Ev10ag944cxiGrEeZsqUfSPaw8Q5ShRIue16WE7BNxK6FlwjoWvBNRL6FmwjoW/BUjQPWwu6kc2DnkRDsXahWtCNtC7sJGqK4O8Df1+EvkZLEfx94O+L0BNYCjpj1A5MI8/VgycwFMOIB+MgGRdHhD0CTRE6B85FAHYIGkXdpnWgXFQPY0+wUIyLh+//Fv8BuGZhzdIgWy0AAAAASUVORK5CYII=","BOARD_W":"data:image/png;base64,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","BOARD_B":"data:image/png;base64,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"};
+const BOARD_PIECE_ASSETS = {"W_P":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA40lEQVR42u2azQ3DIAyFScQkzNIZMktHyCzMkFmySnuq1CIaH4JDjL/vlL8DyC9+PMlTTo9XOGDZtyncGGn9cxic+LlIef15sS9PUxv5t/65fGhtY9L6/Ui0VmZr1NYfrf5zNXm67KIAAACeUc96vfOmr8N2j7ymzaUV7JE3kah2Xhtmg73y5vASPe1Bks9JspQqe9YnaTKtfK68L7/X8smmFZR8LuX1ULIaPolEW/qcVB0Nn4wt5am5eSRKHqTJkAfJg+RB8iASBQAAgO88yLzoKIdt5kUNwLwo86I3l6fLLvoGKqpu8CsHT5gAAAAASUVORK5CYII=","W_F":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA+UlEQVR42u2a0Q3DIAxEA2ISZmCEzsAsGSGzMENHYAZWab9bpYmCazuYe39RJI6Ek80J3MLMo8TX0ftnbo5T3y/GCVJCWywfz2vLIrqiK7i2LPZhsKiETU19oLQ1p7HoaQ/S7mNUfRQZ7T5G1fdXC4VWsejVh0W1+xhVP1yxhya9+uYtCgAAAMyM4857tdbD8VNKpPHP5j/PZps7732P9++N+6/5e8m8t8XCmkj25j9XHuTOe9yRa2/+QVNc4uchDwIAAACW8yA1b+F88E6b7Z68JQXOB2HRG0QeDn2cD5rvg9p9jAqKjHYfG2oFcV90ZItq9VHcFx2dN6bVdeFgnp4lAAAAAElFTkSuQmCC","W_K":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA5klEQVR42u2Zyw2DMBAFCXIlrsElpAbXQgnU4hoowTW4leScHJDwfjAwc0MkWlv7tKMV0wQAAPBcXtYF4rt89t63LZueYb57B4NXobLGn+e8NJe6rh3MS3O7GBH1iOmtLugdzcdEVOwgqeesPcmQ8fKclSdVOyj1nIUniain5yw8GTTjOaIn8aDUU7XW3f+nlEw9yZDR8tT/748OlN7689FDSoZBWaNoUvbUJ6KanpKqoKd+GPlwGvXxIPsg+yD7IPsg+yD7IB48z5N00HPInOG5oTrI98ErR9TKc8NckO+DAAAAoM4Xg9530io7uosAAAAASUVORK5CYII=","W_N":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA2ElEQVR42u2ZwRGEIAxF1bGklGAt1GAJ1kAtlkBP61UvOm74wV3fuzlOCAyffDJ0HQAAwHvp3SMs6XP6f869NP6C4d93cKw1UJnS4dvWHBofsoO2ZtfEvPFItLZMo+OlC/RKq7Y0XyPRa48R+5Q6P0VG7VPq/MPdQhC9MG9+JKr2KXX+8Y48WvJtfnzQLatSTn3MzKRzoMiozlBUwQrdwTKl8EqMRJ9Q6n9iga0uCfgg/SD9IP0g/SD9IP0g/aDQJ3kffMhdlPfBRj6LRCN9kvdBJAoAAAB7NqQ/bfbJk6k7AAAAAElFTkSuQmCC","W_G":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA6ElEQVR42u2awRWEIAxEwUdJlGAt1mAJW4O1WAI97Z73AoovAZP/rx4CODKMIYYGW/h8a8+PsMcgyNP6SzBOurySZf1fuXyqDrS3/q03eORTfWJP6yPRmky06amf7shjJL31zUs0jvY5aZ/0s8mM9jkpn1xm8jkJn/Tlg6N9TsIn01u/uas+aV6iAAAAnhHPeqWUal7LOYuOgZ9OUmdFrYO96hvcyqqeWJCoRqQxMcFRYZo8CAAAYDkP0h+0ctimP/gC6A/SH5xcni530abHcV/0TZtMj8+M9rkW3Bd1I9EZfJL7oh4l+gMlHWvQpl/+8AAAAABJRU5ErkJggg==","W_L":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA5UlEQVR42u2awQ3DIBAEwUpJlOBaqCElpAZqcQn0lLwtJ/gBe465mV9kXXSINTAWMXTyyuHdev4sISrrz1jC5DxG/dGa6+73VpJpvckMbiV1NdZbT0RHx9S6XjrA3miNjqabiAIAAHgmqn1MzVn/fg7bKh+z4lf/i9rHLPnWvy8fVPjYlTHdDfDO0Wz1P31E5XtcrbW5T6WUpD3w0Un1jlgtaKYzuOZqvlITUYulfIoBXnWImH8fxAfxQXwQH8QH8UHHPggAAOCZbtfjvug/HbYVPmZVbzKD3Be9c0RH+CT3RYnokQ81vWvQiqWo/AAAAABJRU5ErkJggg==","W_R":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAAqklEQVR42u3Zyw2DMBAFwHVEJa7B/VdADdtKcsoFwSFSvEhm3g0uTyN/QHaLguz7/j57P8Zos7tfUZjMjMysrKwF3hFAQEBAQEBAQEBAQEBAQEBAwPpslWW9dyP477SrQ1lT9MccD3yrput2Vj5rzX2fj30z+5+xi1ZNl6uRmtlftgbv+ERERLSKksdcny3/q+Z+EBAQEBAQEBAQEBAQEBAQEBBwiSx/P/gBn4Im3U/QufIAAAAASUVORK5CYII=","W_B":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAABf0lEQVR42t3bTRKDIAwFYHhH4Qzc/wScwau0KzqWastP8kiaHYwLPwNxjBpLKY/QRM45BodxZYmllMdxHK+JlJJLZMW1FpwHKaXXAVdXwwOuOmqgPdgbssW1gRblCXmHO49R95o3ZA8u5xxxLihekL24tz3oBTmC+ygy1pGjuMsqahU5g7sEWkTO4m6BlpAruK9AC8hV3E/gTqQErgu4AymF6wYykZK4ISADKY0bBmoiNXBTQA2kFm4aKInUxC0BJZDauGXgCpKBEwHOIFm4EEIQ7Zz1nPjdnAZOLIMjmWTixDPYk8lz71UbpwbsaecxcOJLtGe5MnGqQCuBXUuU9dAMdpFhdwbAxLUveBhIMHF390VNJJi4nHNktz/AxO3o8YCNYyOxA8dEYheOhcROHAOJ3ThtJCzgNJGwgtNCwhJOAwlrOGkkLOIkkbCKk0LCMk4CCeu4VSQ84FaQ8IKbRcITbgYZveFGtxS84noz+VFFveB+IWv8/Ufp8d9/K3gCcyrO1w1KyWIAAAAASUVORK5CYII=","B_P":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA2ElEQVR42u2awQ2EMAwEE0Ql1HI1UCQ1UAutwPcUBYKUmMT2zO8QDxvv2V7JcVt+Z3hgPfYYBqYU/xSMM/9VKv0yqhK5i39KH2pLrBS/H4nmyqyNXPyz1v9cTp4uuygAAIBnxL1eb7/pa9nu4dek+bSCPfwmEpX2a2YS7OU3zUs0NqjMWSPLUmVr5yRNptWcS3+n70vNyaYVLM259dgfJSsxJ5Foyzn3oqGMm2Bt8FJzkjmIH2TZxg+ybOMH8YMAAABg0w9yL2pl2eZeVAHci3IvOrg8XXbRC23oZmiuzfb4AAAAAElFTkSuQmCC","B_F":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA6klEQVR42u2a2w2EIBBFhVCJtVgDRVoDtdCK+29cszI7MwLn/Jp4edzMcANhUWbb1+Pue8k1aOrHZXCSlVDJ9byzJrqmO7jtq9nEsKiFTYeaoLU1p7Fo+GHlXfuYVJ8i493HpPrxaaHwKhat+ljUu49J9dMTe3jSqj+8RQEAAGYmGOS9Q5pJJXlxnsO2dt47/+/fB/dv44+Wea/kqppIrsY/Vx7Uznvaketq/MlT3GLxyIMAAAAj50Fp3uJ+8E2H7Za8ZQX3g1j0BZFHQ5/7weH7oHcfk0KR8e5jXe0g70V7tqhXH+W9aO98AKs2all/7/58AAAAAElFTkSuQmCC","B_K":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA10lEQVR42u2ZwQ2AMAwDAXUSZmGGDtkZOktXgT8PJJrEFDh/QXKiWDlFnSaEEELov5qjDdat7FffW82hNSxfn2BSGbWaz5OV+EonuG5F1hgRVcT0Uw2qo/mbiM4OkzFxLpqTLBkV56I46TpBK+ciOElElZyL4GTyjOeInISDDpzaLTVY/VkyXpw6/393ofT6L3eLtCyDVrNpU/b4E1FPTllR0OOfRi7Owx8Ocg9yD3IPcg9yD3IPwsHnOMkElUvmCc4NNUHeB98c0SjODdMg74MIIYQQctcBiD9sSu9atMUAAAAASUVORK5CYII=","B_N":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAAw0lEQVR42u2ZwRGAIAwEwbFWaqAEaqBZ/To+VAwXGN39OiFgzpwZQgAAAPgv0bxCSdvl81yjNP6G5esVXLutlOu5Mr7xLhUsybYxazwS7S1T73jpAa3S6izN30g0PnizUp9S56fJqH1KnX9pbgTeBzPmR6Jqn1LnX5vkMZKX+fHBDmwj90CTkX1DTg3Lt4K5undiJDpDq6eL4oPMg8yDzIPMg8yDzIP44BCf4n5wmp9t7gfH+CwSdfVJ7geRKAAAABzYAS+6TlnjWdAWAAAAAElFTkSuQmCC","B_G":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAA1klEQVR42u2aQQ6EIAxFC+GscwaOMGfgsrqfTBQxbYG+t9WkiN/+Ypvkho98j6vrTWoSRd7Gz7I5pffGJvV3Z00XOho/P5SL+YO9jY9Er2RizUj88kQenozG316iydvntH0yTpLx9jktn8wz+ZyGT8byQW+f0/DJsuo31+uT20sUAAAgMhZnvcNzDfx00qoVrQp70zfYpJqfWJCoxZGGLIpEAQAA4G8VQX9wl2Kb/uAC0B+kPzi5PENm0dSxM8yLLpNkRnzG2+fuYF40jERn8EnmRSNK9ATDzUwzVgI60QAAAABJRU5ErkJggg==","B_L":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAAzElEQVR42u2ayw2AIBAFwVirNVCCNdCsng1RD+x7fpi5mjVr9omMIadO1iVtV9dLTVlZf8eUfs4cdaNSm8lY6y0TXJe+xnrriWh0TN310gfsjVZ0NIeJKAAAwMhktY+puet/nM22ysdcnPU/qX3MHNem/7F8UOFjT8b08IBfjuZV/7+PqOMbtz3ZAz+dVO+Ia0GzTrBU/0pNRB1LOasoEcUH8UF8EB/EB/FBfBAAAACCbZrzom/abCt8zFVvmSDnRb8c0Qif5LwoEW3ZAegXTDO2eXxiAAAAAElFTkSuQmCC","B_R":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAAkklEQVR42u3ZMQ6AIBAEQDC+5P7/Jr6ilQ2JhQVHwNkOm81EUXLWkpPr5XodXXyUxEREiYjMylzgjAACAgICAgICAgICAgICAgIC5qcm9fxjbDjrDl47A8+son7g21rLA46aNveIZ933jey3B1d/RLd/yfgOOqp93If+DwICAgICAgICAgICAgICAgICLp/t56I3CG0YA0M9xHsAAAAASUVORK5CYII=","B_B":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAABJUlEQVR42u2bWw6EIBRDi0th/2tiK3d+JhMVoqg8bjvyZZSEHkWBUgMAQ14COIuVQCzG+DuRUmKFNAAosViM0b4VNsdkcEWOZV8zpbS+C8b05Fa975ie6ElWa2eEvKyZCfK2VgbIxxo9QzbT5hGyuSZPkN20eIDsrmEm5LC2Z0AOb3Nkg9N6zYiGp7/3PQW4+XL3EOJu7G0pyO3sqYUw9/PfJwJpVjB3hNKtQa8IpnURaoQzWyR1kMxwp5AKcIeQKnCnkKPgFrzl7aJ/95GRHiakB3rpqZr0ZFt6uSS94JW2LKRNJ2nbUNr4lbbupTdfpLfPpDdApbewpUMI0jES6SCQdJRLOownH6dkd7oOITPjd5ecZchtByBLKm8uSofSA8R/K/gAKwm2nOazKX4AAAAASUVORK5CYII="};
+const SAMPLE_LOG = "001. Gg1-e4, Ph7xe4, 002. Ph2-e5, Rh8-h6, 003. Lc1-b4, Lc8-b5, 004. Pe5-h8, Lf8-e5,\n005. Lb4xa7+ Ra8xa7, 006. P-@-g1, Nf7-d6, 007. Nf2-d3, Ra7xa2, 008. Nd3-c1, Ra2xa1,\n009. Kd2-d4, Le5-f2, 010. Ke2xe4, Nd6xe4, 011. P-@-d2, Ke7-f6, 012. Nc2-a3, l-@-e7,\n013. Pd2-c2, g-@-f8, 014. Na3xb5, Nc7xb5, 015. L-@-d2, r-@-c7, 016. Ld2-c5+ Ne4xc5,\n017. Be1xf2, Gb8-d5+ 018. Bf2-e1, Gd5-g3+ 019. Bd1-e2, p-@-c8, 020. L-@-a2, Pc8-f5,\n021. La2xb5, Nc5-e4, 022. N-@-d2, Fg7-g4+ 023. Be2-f3, k-@-c8, 024. Lb5xc8, Gg3-d1,\n025. Bf3xe4, Le7xd4+ 026. Pg1xd4, Fg4xd4, 027. Be4xf5, k-@-a7, 028. L-@-a2, p-@-g7,\n029. La2-b5, Bd8-e7, 030. N-@-h2, Rh6xh2, 031. P-@-g1, Kf6-e5, 032. Pg1xd4, Pg7-g6,\n033. F-@-g1, Pg6-f6+ 034. Bf5-e4, Fb7-d5, 035. Pd4xa7, Kd7-e6+ 036. Lb5xe6, n-@-d7,\n037. Pa7-d4, Gf8-c6, 038. Lc8-f7, n-@-b7, 039. Le6-d3, Nb7-d6+ 040. Be4xd5, Nd6-e4,\n041. Nd2xe4, l-@-h7, 042. N-@-f2, Rh2-h3, 043. Be1-d2, Gc6-e3, 044. F-@-h2, Be7-d8,\n045. Ne4-c3, Rh3-h5, 046. Ld3-a2, Lh7-e6, 047. Nf2-e4, Rh5-f5, 048. Ne4-f2, Le6-b5,\n049. La2xb5, Bd8-e7, 050. Lb5-c8, Ge3-c6, 051. Nf2-e4, Ke5xd4#";
+
+const TYPES = ['K','N','F','L','P','G','R','B'];
+const HAND_TYPES = ['K','N','F','L','P','G','R'];
+const START_FEN = 'rglbblgr/pfnkknfp/8/8/8/8/PFNKKNFP/RGLBBLGR w - - 0 1';
+const FILES = 'abcdefgh';
+const OTHER = { W: 'B', B: 'W' };
+const LOG_FULL_MOVES_PER_LINE = 4;
+const LABEL = { K:'Kirin', N:'Knight', F:'Frog', L:'Lancer', P:'Phoenix', G:'Rogue', R:'Rook', B:'Bishop' };
+const PIECE_COLORS = { P:'#aa2244', F:'#44aa22', K:'#2244aa', N:'#008866', G:'#660088', L:'#886600' };
+const PLAYER_COLORS = { W:'#cccccc', B:'#000000' };
+const MOVE_DELTAS = {
+  K: uniqueDeltas([[2,0],[1,1]]),
+  N: uniqueDeltas([[2,1],[1,2]]),
+  F: uniqueDeltas([[3,0],[2,2]]),
+  L: uniqueDeltas([[3,1],[1,3]]),
+  P: uniqueDeltas([[1,0],[3,3]]),
+  G: uniqueDeltas([[3,2],[2,3]])
+};
+const ROOK_DIRS = [[1,0],[-1,0],[0,1],[0,-1]];
+const BISHOP_DIRS = [[1,1],[1,-1],[-1,1],[-1,-1]];
+
+let orientation = 'W';
+let snapshots = [];
+let records = [];
+let viewIndex = 0;
+let selected = null;
+let legalForSelection = [];
+
+const el = {
+  blackPanel: document.getElementById('blackPanel'),
+  whitePanel: document.getElementById('whitePanel'),
+  board: document.getElementById('boardWrap'),
+  pieces: document.getElementById('pieceLayer'),
+  buttons: document.getElementById('buttonLayer'),
+  overlay: document.getElementById('overlay'),
+  blackHand: document.getElementById('blackHand'),
+  whiteHand: document.getElementById('whiteHand'),
+  blackStatus: document.getElementById('blackStatusBox'),
+  whiteStatus: document.getElementById('whiteStatusBox'),
+  blackTurnLine: document.getElementById('blackTurnLine'),
+  whiteTurnLine: document.getElementById('whiteTurnLine'),
+  log: document.getElementById('logText'),
+  paste: document.getElementById('pasteArea'),
+  turnPill: document.getElementById('turnPill'),
+  plyPill: document.getElementById('plyPill'),
+  viewPill: document.getElementById('viewPill'),
+  newBtn: document.getElementById('newBtn'),
+  flipBtn: document.getElementById('flipBtn'),
+  prevBtn: document.getElementById('prevBtn'),
+  nextBtn: document.getElementById('nextBtn'),
+  undoBtn: document.getElementById('undoBtn'),
+  copyBtn: document.getElementById('copyBtn'),
+  exportBtn: document.getElementById('exportBtn'),
+  fileInput: document.getElementById('fileInput'),
+  loadPasteBtn: document.getElementById('loadPasteBtn'),
+  loadSampleBtn: document.getElementById('loadSampleBtn'),
+};
+
+function uniqueDeltas(basePairs) {
+  const out = new Map();
+  for (const [a,b] of basePairs) {
+    const pairs = a === b ? [[a,b]] : [[a,b],[b,a]];
+    for (const [x,y] of pairs) {
+      for (const sx of [-1,1]) for (const sy of [-1,1]) {
+        const dx = x * sx, dy = y * sy;
+        if (dx === 0 && sx < 0) continue;
+        if (dy === 0 && sy < 0) continue;
+        out.set(dx + ',' + dy, [dx,dy]);
+      }
+    }
+  }
+  return [...out.values()];
+}
+function emptyHands() {
+  return { K:0, N:0, F:0, L:0, P:0, G:0, R:0 };
+}
+function cloneHands(h) { return { W: {...h.W}, B: {...h.B} }; }
+function cloneBoard(board) {
+  return board.map(row => row.map(p => p ? {...p} : null));
+}
+function cloneState(s) {
+  return {
+    board: cloneBoard(s.board), turn: s.turn, hands: cloneHands(s.hands),
+    ply: s.ply, halfmove: s.halfmove, result: s.result,
+    lastMove: s.lastMove ? JSON.parse(JSON.stringify(s.lastMove)) : null,
+    positionCounts: {...s.positionCounts}
+  };
+}
+function parseStart() {
+  const board = Array.from({length:8}, () => Array(8).fill(null));
+  const rows = START_FEN.split(' ')[0].split('/');
+  for (let fenRank = 0; fenRank < 8; fenRank++) {
+    const y = 7 - fenRank;
+    let x = 0;
+    for (const ch of rows[fenRank]) {
+      if (/\d/.test(ch)) { x += Number(ch); continue; }
+      const color = ch === ch.toUpperCase() ? 'W' : 'B';
+      board[y][x++] = { color, type: ch.toUpperCase() };
+    }
+  }
+  const state = { board, turn: 'W', hands: { W: emptyHands(), B: emptyHands() }, ply: 0, halfmove: 0, result: null, lastMove: null, positionCounts: {} };
+  state.positionCounts[positionKey(state)] = 1;
+  return state;
+}
+function resetGame() {
+  snapshots = [parseStart()];
+  records = [];
+  viewIndex = 0;
+  selected = null;
+  legalForSelection = [];
+  render('New game ready.');
+}
+function current() { return snapshots[viewIndex]; }
+function isLive() { return viewIndex === snapshots.length - 1; }
+function inBounds(x,y) { return x >= 0 && x < 8 && y >= 0 && y < 8; }
+function coord(x,y) { return FILES[x] + String(y+1); }
+function fromCoord(s) { return { x: FILES.indexOf(s[0]), y: Number(s[1])-1 }; }
+function pieceLetter(piece) { return piece.type; }
+function dropLetter(type, color) { return color === 'W' ? type : type.toLowerCase(); }
+function assetFor(piece) { return ASSETS[piece.color + '_' + piece.type]; }
+function boardAssetFor(piece) { return BOARD_PIECE_ASSETS[piece.color + '_' + piece.type]; }
+function highlightColors(type, color) {
+  const player = PLAYER_COLORS[color];
+  const otherPlayer = PLAYER_COLORS[OTHER[color]];
+  if (type === 'B') return { main: player, player: otherPlayer, showPlayer: true };
+  if (type === 'R') return { main: player, player: null, showPlayer: false };
+  return { main: PIECE_COLORS[type] || player, player, showPlayer: true };
+}
+function captureThinHighlightColor(captured) {
+  if (!captured) return null;
+  if (captured.type === 'R' || captured.type === 'B') return PLAYER_COLORS[captured.color];
+  return PIECE_COLORS[captured.type] || PLAYER_COLORS[captured.color];
+}
+function highlightRectSvg(r, type, color, blocked=false) {
+  const c = highlightColors(type, color);
+  const dash4 = blocked ? ' stroke-dasharray="1 7" stroke-linecap="round"' : ' shape-rendering="crispEdges"';
+  const dash1 = blocked ? ' stroke-dasharray="1 4" stroke-linecap="round"' : ' shape-rendering="crispEdges"';
+  const parts = [];
+  // 4px thick visible 64x64 primary outline, aligned to the square.
+  parts.push(`<rect x="${r.sx + 2}" y="${r.sy + 2}" width="60" height="60" fill="none" stroke="${c.main}" stroke-width="4" vector-effect="none"${dash4}/>`);
+  // 1px thick visible 62x62 secondary outline, if the piece class uses one.
+  if (c.showPlayer) parts.push(`<rect x="${r.sx + 1.5}" y="${r.sy + 1.5}" width="61" height="61" fill="none" stroke="${c.player}" stroke-width="1" vector-effect="none"${dash1}/>`);
+  if (!blocked) parts.push(`<rect x="${r.sx+28}" y="${r.sy+28}" width="8" height="8" fill="${c.main}" shape-rendering="crispEdges"/>`);
+  return parts.join('');
+}
+function previousCaptureRectSvg(r, captured) {
+  const stroke = captureThinHighlightColor(captured);
+  if (!stroke) return '';
+  return `<rect x="${r.sx + 1.5}" y="${r.sy + 1.5}" width="61" height="61" fill="none" stroke="${stroke}" stroke-width="1" vector-effect="none" shape-rendering="crispEdges"/>`;
+}
+function selectedRectSvg(r, color) {
+  const stroke = PLAYER_COLORS[color];
+  // 5px thick visible 68x68 selection outline, using only the player color.
+  return `<rect x="${r.sx + 0.5}" y="${r.sy + 0.5}" width="63" height="63" fill="none" stroke="${stroke}" stroke-width="5" vector-effect="none" shape-rendering="crispEdges"/>`;
+}
+function blockedGeometryForSelection(s, sel) {
+  if (!sel || sel.kind !== 'move') return [];
+  const p = s.board[sel.from.y][sel.from.x];
+  if (!p) return [];
+  const out = [];
+  const seen = new Set();
+  const add = (x,y,reason) => {
+    if (!inBounds(x,y)) return;
+    const key = x + ',' + y;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ x, y, reason });
+  };
+  if (p.type === 'R' || p.type === 'B') {
+    const dirs = p.type === 'R' ? ROOK_DIRS : BISHOP_DIRS;
+    for (const [dx,dy] of dirs) {
+      let tx = sel.from.x + dx, ty = sel.from.y + dy;
+      let blocked = false;
+      while (inBounds(tx,ty)) {
+        const q = s.board[ty][tx];
+        if (blocked) add(tx, ty, 'path');
+        else if (q) {
+          if (q.color === p.color) add(tx, ty, 'friendly');
+          blocked = true;
+        }
+        tx += dx; ty += dy;
+      }
+    }
+  } else {
+    for (const [dx,dy] of MOVE_DELTAS[p.type] || []) {
+      const tx = sel.from.x + dx, ty = sel.from.y + dy;
+      if (!inBounds(tx,ty)) continue;
+      const q = s.board[ty][tx];
+      if (q && q.color === p.color) add(tx, ty, 'friendly');
+    }
+  }
+  return out;
+}
+function screenRect(x,y) {
+  if (orientation === 'W') return { sx: 64 + x*64, sy: 64 + (7-y)*64 };
+  return { sx: 64 + (7-x)*64, sy: 64 + y*64 };
+}
+function cssRect(x,y) {
+  const r = screenRect(x,y);
+  return { left: (r.sx/640*100) + '%', top: (r.sy/640*100) + '%' };
+}
+function pieceCssRect(x,y) {
+  const r = screenRect(x,y);
+  return {
+    left: ((r.sx + 4) / 640 * 100) + '%',
+    top: ((r.sy + 4) / 640 * 100) + '%',
+    width: (56 / 640 * 100) + '%',
+    height: (56 / 640 * 100) + '%'
+  };
+}
+function positionKey(s) {
+  const rows = [];
+  for (let y=7; y>=0; y--) {
+    let row = '';
+    for (let x=0; x<8; x++) {
+      const p = s.board[y][x];
+      row += p ? (p.color === 'W' ? p.type : p.type.toLowerCase()) : '1';
+    }
+    rows.push(row);
+  }
+  const hw = HAND_TYPES.map(t => t + s.hands.W[t]).join('');
+  const hb = HAND_TYPES.map(t => t + s.hands.B[t]).join('');
+  return rows.join('/') + ' ' + s.turn + ' W[' + hw + '] B[' + hb + ']';
+}
+function bishopSquares(s, color) {
+  const out=[];
+  for (let y=0;y<8;y++) for (let x=0;x<8;x++) {
+    const p=s.board[y][x];
+    if (p && p.color===color && p.type==='B') out.push({x,y});
+  }
+  return out;
+}
+function isSquareAttackedBy(s, x, y, color) {
+  for (let py=0; py<8; py++) for (let px=0; px<8; px++) {
+    const p = s.board[py][px];
+    if (!p || p.color !== color) continue;
+    if (pieceAttacksSquare(s, px, py, p, x, y)) return true;
+  }
+  return false;
+}
+function pieceAttacksSquare(s, px, py, p, tx, ty) {
+  if (p.type === 'R' || p.type === 'B') {
+    const dirs = p.type === 'R' ? ROOK_DIRS : BISHOP_DIRS;
+    for (const [dx,dy] of dirs) {
+      let x=px+dx, y=py+dy;
+      while (inBounds(x,y)) {
+        if (x===tx && y===ty) return true;
+        if (s.board[y][x]) break;
+        x += dx; y += dy;
+      }
+    }
+    return false;
+  }
+  for (const [dx,dy] of MOVE_DELTAS[p.type] || []) if (px+dx===tx && py+dy===ty) return true;
+  return false;
+}
+function ownBishopsAttacked(s, color) {
+  const bishops = bishopSquares(s, color);
+  if (bishops.length === 0) return true;
+  return bishops.some(b => isSquareAttackedBy(s, b.x, b.y, OTHER[color]));
+}
+function checkedBishops(s, color) {
+  return bishopSquares(s, color).filter(b => isSquareAttackedBy(s, b.x, b.y, OTHER[color]));
+}
+function attackersOfSquare(s, x, y, color) {
+  const out = [];
+  for (let py=0; py<8; py++) for (let px=0; px<8; px++) {
+    const p = s.board[py][px];
+    if (!p || p.color !== color) continue;
+    if (pieceAttacksSquare(s, px, py, p, x, y)) out.push({ x:px, y:py, piece:p });
+  }
+  return out;
+}
+function checkMarkerColor(s, bishopSq, bishopColor) {
+  const attackerColor = OTHER[bishopColor];
+  const attackers = attackersOfSquare(s, bishopSq.x, bishopSq.y, attackerColor);
+  if (!attackers.length) return PLAYER_COLORS[attackerColor];
+  const lineChecker = attackers.find(a => a.piece.type === 'R' || a.piece.type === 'B');
+  if (lineChecker) return PLAYER_COLORS[attackerColor];
+  if (s.lastMove && s.lastMove.to) {
+    const direct = attackers.find(a => a.x === s.lastMove.to.x && a.y === s.lastMove.to.y);
+    if (direct) return PIECE_COLORS[direct.piece.type] || PLAYER_COLORS[attackerColor];
+  }
+  return PIECE_COLORS[attackers[0].piece.type] || PLAYER_COLORS[attackerColor];
+}
+function checkedBishopMarkerSvg(r, color) {
+  const x = r.sx, y = r.sy;
+  const sw = 7;
+  const inset = 1.5;
+  const far = 62.5;
+  const len = 16;
+  const lines = [
+    [inset,inset, inset+len,inset], [inset,inset, inset,inset+len],
+    [far,inset, far-len,inset], [far,inset, far,inset+len],
+    [inset,far, inset+len,far], [inset,far, inset,far-len],
+    [far,far, far-len,far], [far,far, far,far-len],
+  ].map(([x1,y1,x2,y2]) => `<line x1="${x+x1}" y1="${y+y1}" x2="${x+x2}" y2="${y+y2}" stroke="${color}" stroke-width="${sw}" stroke-linecap="butt" vector-effect="none" shape-rendering="crispEdges"/>`).join('');
+  const center = `<rect x="${x+24}" y="${y+24}" width="16" height="16" fill="none" stroke="${color}" stroke-width="4" vector-effect="none" shape-rendering="crispEdges"/>`;
+  return lines + center;
+}
+function pseudoMovesForPiece(s, x, y, p) {
+  const out = [];
+  if (p.type === 'R' || p.type === 'B') {
+    const dirs = p.type === 'R' ? ROOK_DIRS : BISHOP_DIRS;
+    for (const [dx,dy] of dirs) {
+      let tx=x+dx, ty=y+dy;
+      while (inBounds(tx,ty)) {
+        const q = s.board[ty][tx];
+        if (!q) out.push({ kind:'move', from:{x,y}, to:{x:tx,y:ty}, piece:p.type });
+        else {
+          if (q.color !== p.color) out.push({ kind:'move', from:{x,y}, to:{x:tx,y:ty}, piece:p.type });
+          break;
+        }
+        tx += dx; ty += dy;
+      }
+    }
+    return out;
+  }
+  for (const [dx,dy] of MOVE_DELTAS[p.type] || []) {
+    const tx=x+dx, ty=y+dy;
+    if (!inBounds(tx,ty)) continue;
+    const q=s.board[ty][tx];
+    if (!q || q.color !== p.color) out.push({ kind:'move', from:{x,y}, to:{x:tx,y:ty}, piece:p.type });
+  }
+  return out;
+}
+function applyBoardOnly(s, mv) {
+  const n = cloneState(s);
+  n.result = null;
+  n.lastMove = null;
+  if (mv.kind === 'drop') {
+    n.hands[s.turn][mv.piece] -= 1;
+    n.board[mv.to.y][mv.to.x] = { color: s.turn, type: mv.piece };
+  } else {
+    const p = n.board[mv.from.y][mv.from.x];
+    n.board[mv.from.y][mv.from.x] = null;
+    n.board[mv.to.y][mv.to.x] = p;
+  }
+  return n;
+}
+function isLegalMove(s, mv) {
+  if (s.result) return false;
+  const n = applyBoardOnly(s, mv);
+  return !ownBishopsAttacked(n, s.turn);
+}
+function generateLegalMoves(s) {
+  if (s.result) return [];
+  const out=[];
+  for (let y=0;y<8;y++) for (let x=0;x<8;x++) {
+    const p=s.board[y][x];
+    if (!p || p.color !== s.turn) continue;
+    for (const mv of pseudoMovesForPiece(s,x,y,p)) if (isLegalMove(s,mv)) out.push(mv);
+  }
+  const ranks = s.turn === 'W' ? [0,1] : [6,7];
+  for (const type of HAND_TYPES) {
+    if (s.hands[s.turn][type] <= 0) continue;
+    for (const y of ranks) for (let x=0;x<8;x++) {
+      if (s.board[y][x]) continue;
+      const mv = { kind:'drop', piece:type, to:{x,y} };
+      if (isLegalMove(s,mv)) out.push(mv);
+    }
+  }
+  return out;
+}
+function sameSquare(a,b) { return a && b && a.x===b.x && a.y===b.y; }
+function sameMove(a,b) {
+  if (a.kind !== b.kind || a.piece !== b.piece || !sameSquare(a.to,b.to)) return false;
+  if (a.kind === 'drop') return true;
+  return sameSquare(a.from,b.from);
+}
+function makeMove(mv, source='play') {
+  const s = current();
+  if (!isLive()) {
+    snapshots = snapshots.slice(0, viewIndex+1);
+    records = records.slice(0, viewIndex);
+  }
+  const legals = generateLegalMoves(s);
+  const legal = legals.find(m => sameMove(m,mv));
+  if (!legal) { render('Illegal move for the current position.'); return false; }
+  const next = applyScoredMove(s, legal);
+  snapshots.push(next);
+  records.push(next.lastMove);
+  viewIndex++;
+  selected = null;
+  legalForSelection = [];
+  render(source === 'load' ? null : describeLast(next.lastMove));
+  return true;
+}
+function applyScoredMove(s, mv) {
+  const n = cloneState(s);
+  const mover = s.turn;
+  let captured = null;
+  let capturedBishop = false;
+  if (mv.kind === 'drop') {
+    n.hands[mover][mv.piece] -= 1;
+    n.board[mv.to.y][mv.to.x] = { color:mover, type:mv.piece };
+    n.halfmove = 0;
+  } else {
+    const p = n.board[mv.from.y][mv.from.x];
+    captured = n.board[mv.to.y][mv.to.x];
+    n.board[mv.from.y][mv.from.x] = null;
+    n.board[mv.to.y][mv.to.x] = p;
+    if (captured && captured.type !== 'B') n.hands[mover][captured.type] += 1;
+    capturedBishop = !!(captured && captured.type === 'B');
+    n.halfmove = captured ? 0 : s.halfmove + 1;
+  }
+  n.ply = s.ply + 1;
+  n.turn = OTHER[mover];
+  let suffix = ',';
+  let result = null;
+  let note = '';
+  if (capturedBishop) {
+    suffix = '#';
+    result = mover === 'W' ? '1-0' : '0-1';
+    note = 'Bishop capture.';
+  } else {
+    const check = checkedBishops(n, n.turn).length > 0;
+    const opponentLegals = generateLegalMoves(n);
+    if (opponentLegals.length === 0) {
+      suffix = '#';
+      result = mover === 'W' ? '1-0' : '0-1';
+      note = check ? 'Mate / no legal move.' : 'Stalemate loss / no legal move.';
+    } else {
+      const keyBeforeCount = n.positionCounts[positionKey(n)] || 0;
+      if (n.halfmove >= 128 || n.ply >= 4096 || keyBeforeCount + 1 >= 3) {
+        suffix = '=';
+        result = '1/2-1/2';
+        note = n.halfmove >= 128 ? '128 plies without capture or drop.' : (n.ply >= 4096 ? '4096-ply limit.' : 'Threefold repetition.');
+      } else if (check) {
+        suffix = '+';
+        note = 'Bishop in check.';
+      }
+    }
+  }
+  n.result = result;
+  const notation = notationForMove(s, mv, captured, suffix);
+  const squares = mv.kind === 'drop' ? [mv.to] : [mv.from, mv.to];
+  n.lastMove = { notation, mover, kind: mv.kind, piece: mv.piece, from: mv.from || null, to: mv.to, captured: captured ? {...captured} : null, squares, suffix, result, note };
+  if (!result) {
+    const key = positionKey(n);
+    n.positionCounts[key] = (n.positionCounts[key] || 0) + 1;
+  }
+  return n;
+}
+function notationForMove(s, mv, captured, suffix) {
+  if (mv.kind === 'drop') return dropLetter(mv.piece, s.turn) + '-@-' + coord(mv.to.x,mv.to.y) + suffix;
+  const p = s.board[mv.from.y][mv.from.x];
+  const sep = captured ? 'x' : '-';
+  return pieceLetter(p) + coord(mv.from.x,mv.from.y) + sep + coord(mv.to.x,mv.to.y) + suffix;
+}
+function describeLast(rec) {
+  if (!rec) return 'Ready.';
+  let text = `<strong>${rec.mover === 'W' ? 'White' : 'Black'}:</strong> ${escapeHtml(rec.notation)}`;
+  if (rec.note) text += `<br><span class="small">${escapeHtml(rec.note)}</span>`;
+  if (rec.result) text += `<br><strong>Result:</strong> ${escapeHtml(rec.result)}`;
+  return text;
+}
+
+function renderPlayerPanelLayout() {
+  const blackOnFarSide = orientation === 'W';
+  const farPanel = blackOnFarSide ? el.blackPanel : el.whitePanel;
+  const nearPanel = blackOnFarSide ? el.whitePanel : el.blackPanel;
+  for (const panel of [el.blackPanel, el.whitePanel]) {
+    panel.classList.remove('playerPanelTop', 'playerPanelBottom');
+  }
+  farPanel.classList.add('playerPanelTop');
+  nearPanel.classList.add('playerPanelBottom');
+}
+
+function render(message=null) {
+  const s = current();
+  renderPlayerPanelLayout();
+  el.board.style.setProperty('--board-image', `url(${ASSETS['BOARD_' + orientation]})`);
+  renderButtons();
+  renderPieces(s);
+  renderHands(s);
+  renderOverlay(s);
+  renderLog();
+  renderStatus(s, message);
+  el.turnPill.textContent = s.result ? 'Game over' : 'Turn: ' + (s.turn === 'W' ? 'White' : 'Black');
+  el.plyPill.textContent = 'Ply: ' + s.ply;
+  el.viewPill.textContent = isLive() ? 'Live board' : `Review ${viewIndex}/${snapshots.length-1}`;
+  el.prevBtn.disabled = viewIndex <= 0;
+  el.nextBtn.disabled = viewIndex >= snapshots.length - 1;
+  el.undoBtn.disabled = records.length === 0 || !isLive();
+}
+function renderButtons() {
+  el.buttons.innerHTML = '';
+  for (let y=0;y<8;y++) for (let x=0;x<8;x++) {
+    const b = document.createElement('button');
+    b.className = 'squareBtn';
+    const r = cssRect(x,y);
+    b.style.left = r.left; b.style.top = r.top;
+    b.setAttribute('aria-label', coord(x,y));
+    b.addEventListener('click', () => onSquareTap(x,y));
+    el.buttons.appendChild(b);
+  }
+}
+function renderPieces(s) {
+  el.pieces.innerHTML = '';
+  for (let y=0;y<8;y++) for (let x=0;x<8;x++) {
+    const p = s.board[y][x];
+    if (!p) continue;
+    const img = document.createElement('img');
+    img.className = 'pieceImg';
+    img.src = boardAssetFor(p);
+    img.alt = (p.color === 'W' ? 'White ' : 'Black ') + LABEL[p.type];
+    const r = pieceCssRect(x,y);
+    img.style.left = r.left; img.style.top = r.top;
+    img.style.width = r.width; img.style.height = r.height;
+    el.pieces.appendChild(img);
+  }
+}
+function renderHands(s) {
+  renderPlayerHand(s, 'B', el.blackHand);
+  renderPlayerHand(s, 'W', el.whiteHand);
+}
+function renderPlayerHand(s, color, container) {
+  container.innerHTML = '';
+  const lab = document.createElement('div');
+  lab.className = 'handLabel';
+  lab.textContent = color === 'W' ? 'W' : 'B';
+  container.appendChild(lab);
+  for (const type of HAND_TYPES) {
+    const btn = document.createElement('button');
+    btn.className = 'handBtn';
+    if (selected && selected.kind === 'drop' && selected.color === color && selected.piece === type) btn.classList.add('selected');
+    btn.disabled = color !== s.turn || s.hands[color][type] <= 0 || !isLive() || !!s.result;
+    btn.title = `${color === 'W' ? 'White' : 'Black'} ${LABEL[type]} in hand`;
+    const img = document.createElement('img');
+    img.src = ASSETS[color + '_' + type];
+    img.alt = LABEL[type];
+    const count = document.createElement('span');
+    count.className = 'handCount';
+    count.textContent = '×' + s.hands[color][type];
+    btn.appendChild(img); btn.appendChild(count);
+    btn.addEventListener('click', () => onHandTap(color,type));
+    container.appendChild(btn);
+  }
+}
+function renderOverlay(s) {
+  const parts = [];
+  if (s.lastMove) {
+    const stroke = s.lastMove.mover === 'W' ? '#cccccc' : '#000000';
+    for (const sq of s.lastMove.squares) {
+      const r = screenRect(sq.x, sq.y);
+      parts.push(`<rect x="${r.sx}" y="${r.sy}" width="64" height="64" fill="none" stroke="${stroke}" stroke-width="4" vector-effect="none" shape-rendering="crispEdges"/>`);
+      if (s.lastMove.captured && s.lastMove.to && sq.x === s.lastMove.to.x && sq.y === s.lastMove.to.y) {
+        parts.push(previousCaptureRectSvg(r, s.lastMove.captured));
+      }
+    }
+  }
+  if (selected) {
+    const selSq = selected.kind === 'move' ? selected.from : null;
+    if (selSq) {
+      const r = screenRect(selSq.x, selSq.y);
+      parts.push(selectedRectSvg(r, selected.color || s.turn));
+    }
+    const selectedColor = selected.color || s.turn;
+    const selectedType = selected.piece;
+    const legalKeys = new Set(legalForSelection.map(mv => mv.to.x + ',' + mv.to.y));
+    for (const sq of blockedGeometryForSelection(s, selected)) {
+      const key = sq.x + ',' + sq.y;
+      if (legalKeys.has(key)) continue;
+      const r = screenRect(sq.x, sq.y);
+      parts.push(highlightRectSvg(r, selectedType, selectedColor, true));
+    }
+    for (const mv of legalForSelection) {
+      const r = screenRect(mv.to.x, mv.to.y);
+      parts.push(highlightRectSvg(r, selectedType, selectedColor, false));
+    }
+  }
+  for (const color of ['W','B']) {
+    const checked = checkedBishops(s, color);
+    for (const b of checked) {
+      const r = screenRect(b.x,b.y);
+      parts.push(checkedBishopMarkerSvg(r, checkMarkerColor(s, b, color)));
+    }
+  }
+  el.overlay.innerHTML = parts.join('');
+}
+function moveNumberLabel(moveNumber) {
+  return String(moveNumber % 1000).padStart(3,'0') + '.';
+}
+function renderLog() {
+  const chunks = [];
+  for (let i=0; i<records.length; i+=2) {
+    const moveNo = moveNumberLabel(Math.floor(i/2)+1);
+    const w = records[i]?.notation || '';
+    const b = records[i+1]?.notation || '';
+    chunks.push(`${moveNo} ${w}${b ? ' ' + b : ''}`);
+  }
+  const lines = [];
+  for (let i=0; i<chunks.length; i+=LOG_FULL_MOVES_PER_LINE) {
+    lines.push(chunks.slice(i, i + LOG_FULL_MOVES_PER_LINE).join(' '));
+  }
+  const last = snapshots[snapshots.length-1];
+  if (last.result) lines.push(last.result);
+  el.log.value = lines.join('\n');
+}
+function renderStatus(s, message) {
+  const active = s.result ? null : s.turn;
+  el.whiteTurnLine.textContent = playerTurnText(s, 'W');
+  el.blackTurnLine.textContent = playerTurnText(s, 'B');
+  el.whiteStatus.innerHTML = playerStatusHtml(s, 'W', message, active);
+  el.blackStatus.innerHTML = playerStatusHtml(s, 'B', message, active);
+}
+function playerTurnText(s, color) {
+  if (s.result) return 'Game over';
+  if (!isLive()) return color === orientation ? `Review ${viewIndex}/${snapshots.length-1}` : 'Review';
+  return s.turn === color ? 'To move' : 'Waiting';
+}
+function playerStatusHtml(s, color, message, active) {
+  const name = color === 'W' ? 'White' : 'Black';
+  const opp = OTHER[color] === 'W' ? 'White' : 'Black';
+  if (!isLive()) return reviewStatusHtml(s, color);
+  if (s.result) return `<strong>Game over:</strong> ${escapeHtml(s.result)}`;
+  if (message && active === color) return message;
+  if (message && active !== color) return `<strong>${opp} is choosing.</strong><br><span class="small">Waiting for your turn.</span>`;
+  if (s.turn !== color) return `<strong>${opp} to move.</strong><br><span class="small">Waiting for your turn.</span>`;
+  const check = checkedBishops(s, color).length;
+  if (check) return `<strong>${name} to move:</strong> ${check} royal bishop${check>1?'s are':' is'} in check.`;
+  return `<strong>${name} to move.</strong> Tap a piece or hand piece.`;
+}
+function reviewStatusHtml(s, color) {
+  if (color !== orientation) return `<strong>Review mode.</strong><br><span class="small">Use controls below host side.</span>`;
+  const currentPly = viewIndex;
+  const lastPly = snapshots.length - 1;
+  const lastRec = currentPly > 0 ? records[currentPly - 1] : null;
+  const moveLine = lastRec ? `Last move: ${escapeHtml(lastRec.notation)}` : 'Start position.';
+  const stateLine = s.result ? `Result: ${escapeHtml(s.result)}` : `${s.turn === 'W' ? 'White' : 'Black'} to move.`;
+  return `<strong>Review ply ${currentPly}/${lastPly}.</strong><br><span class="small">${moveLine}</span><br><span class="small">${stateLine}</span>`;
+}
+function onSquareTap(x,y) {
+  const s = current();
+  if (s.result) return render('Game is over. Start a new game or load another log.');
+  if (!isLive()) {
+    snapshots = snapshots.slice(0, viewIndex+1);
+    records = records.slice(0, viewIndex);
+  }
+  const p = s.board[y][x];
+  if (!selected) {
+    if (p && p.color === s.turn) selectPiece(x,y);
+    else render('Tap one of your pieces, or a piece in hand.');
+    return;
+  }
+  const chosen = legalForSelection.find(mv => sameSquare(mv.to, {x,y}));
+  if (chosen) { makeMove(chosen); return; }
+  if (p && p.color === s.turn) { selectPiece(x,y); return; }
+  selected = null; legalForSelection = []; render('Selection cleared.'); render();
+}
+function selectPiece(x,y) {
+  const s = current();
+  const p = s.board[y][x];
+  selected = { kind:'move', from:{x,y}, piece:p.type, color:p.color };
+  legalForSelection = generateLegalMoves(s).filter(mv => mv.kind === 'move' && mv.from.x===x && mv.from.y===y);
+  render(`<strong>${LABEL[p.type]} ${coord(x,y)} selected.</strong><br><span class="small">${legalForSelection.length} legal target${legalForSelection.length===1?'':'s'}.</span>`);
+}
+function onHandTap(color,type) {
+  const s = current();
+  if (color !== s.turn || s.hands[color][type] <= 0 || s.result) return;
+  selected = { kind:'drop', color, piece:type };
+  legalForSelection = generateLegalMoves(s).filter(mv => mv.kind === 'drop' && mv.piece === type);
+  render(`<strong>Drop ${LABEL[type]} selected.</strong><br><span class="small">${legalForSelection.length} legal square${legalForSelection.length===1?'':'s'} in home ranks.</span>`);
+}
+function escapeHtml(str) { return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function parseMoveTokens(text) {
+  return text
+    .replace(/\r/g,' ')
+    .replace(/```[\s\S]*?```/g, block => block.replace(/```/g,' '))
+    .split(/\s+/)
+    .map(t => t.trim().replace(/;+$/,''))
+    .filter(t => t && !/^[0-9]{1,4}\.$/.test(t) && !/^(1-0|0-1|1\/2-1\/2|[+-]?1|0|=0)$/.test(t))
+    .filter(t => /@|[a-h][1-8][x-][a-h][1-8]/i.test(t));
+}
+function parseNotationMove(tok, s) {
+  const clean = tok.replace(/[,+#=]+$/,'');
+  let m = clean.match(/^([KFNLPGRBkfnlpgr])-@-([a-h][1-8])$/);
+  if (m) {
+    const piece = m[1].toUpperCase();
+    const to = fromCoord(m[2]);
+    return generateLegalMoves(s).find(mv => mv.kind==='drop' && mv.piece===piece && sameSquare(mv.to,to));
+  }
+  m = clean.match(/^([KFNLPGRB])([a-h][1-8])([x-])([a-h][1-8])$/i);
+  if (m) {
+    const piece = m[1].toUpperCase(), from = fromCoord(m[2]), to = fromCoord(m[4]);
+    return generateLegalMoves(s).find(mv => mv.kind==='move' && mv.piece===piece && sameSquare(mv.from,from) && sameSquare(mv.to,to));
+  }
+  return null;
+}
+function loadMoveLog(text) {
+  const tokens = parseMoveTokens(text);
+  snapshots = [parseStart()]; records = []; viewIndex = 0; selected = null; legalForSelection = [];
+  let failed = null;
+  for (const tok of tokens) {
+    const s = current();
+    const mv = parseNotationMove(tok, s);
+    if (!mv) { failed = tok; break; }
+    const ok = makeMove(mv, 'load');
+    if (!ok) { failed = tok; break; }
+  }
+  viewIndex = snapshots.length - 1;
+  if (failed) render(`<strong>Stopped while loading.</strong><br><span class="small">Could not apply token: ${escapeHtml(failed)}</span>`);
+  else render(`<strong>Loaded ${records.length} move${records.length===1?'':'s'}.</strong>`);
+}
+function exportJson() {
+  const data = { app: 'Battledance Chess GUI', version: 9, exportedAt: new Date().toISOString(), moves: records.map(r => r.notation), log: el.log.value };
+  const blob = new Blob([JSON.stringify(data,null,2)], { type:'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'battledance-chess-game.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+async function copyLog() {
+  try { await navigator.clipboard.writeText(el.log.value); render('Move log copied.'); }
+  catch { el.log.focus(); el.log.select(); render('Could not access clipboard; the log is selected for manual copy.'); }
+}
+function importJsonFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(String(reader.result));
+      if (Array.isArray(data.moves)) loadMoveLog(data.moves.join(' '));
+      else if (typeof data.log === 'string') loadMoveLog(data.log);
+      else render('JSON did not contain a moves array or log string.');
+    } catch (e) { render('Could not read that JSON file.'); }
+  };
+  reader.readAsText(file);
+}
+function maybeConfirmNew() {
+  if (records.length && !confirm('Start a new game and clear the current log?')) return;
+  resetGame();
+}
+function go(delta) {
+  viewIndex = Math.max(0, Math.min(snapshots.length-1, viewIndex + delta));
+  selected = null; legalForSelection = [];
+  render();
+}
+el.newBtn.addEventListener('click', maybeConfirmNew);
+el.flipBtn.addEventListener('click', () => { orientation = OTHER[orientation]; render('Board flipped.'); });
+el.prevBtn.addEventListener('click', () => go(-1));
+el.nextBtn.addEventListener('click', () => go(1));
+el.undoBtn.addEventListener('click', () => { if (records.length && isLive()) { records.pop(); snapshots.pop(); viewIndex = snapshots.length-1; selected=null; legalForSelection=[]; render('Last move undone.'); } });
+el.copyBtn.addEventListener('click', copyLog);
+el.exportBtn.addEventListener('click', exportJson);
+el.fileInput.addEventListener('change', e => { const f=e.target.files[0]; if (f) importJsonFile(f); e.target.value=''; });
+el.loadPasteBtn.addEventListener('click', () => loadMoveLog(el.paste.value));
+el.loadSampleBtn.addEventListener('click', () => { el.paste.value = SAMPLE_LOG; loadMoveLog(SAMPLE_LOG); });
+
+resetGame();
+</script>
+</body>
+</html>

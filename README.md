@@ -242,11 +242,11 @@ You do not need to know the naming theme to understand the trainer. Each name is
 Each agent has snapshot slots:
 
 ```text
-Name_0.pkl   Active training population or current parent checkpoint.
-Name_1.pkl   Most recent retained trained parents.
-Name_2.pkl   Older retained champion snapshot.
-Name_3.pkl   Older retained champion snapshot.
-Name_4.pkl   Older retained champion snapshot.
+Name_0.bdpop   Active training population or current parent checkpoint.
+Name_1.bdpop   Most recent retained trained parents.
+Name_2.bdpop   Older retained champion snapshot.
+Name_3.bdpop   Older retained champion snapshot.
+Name_4.bdpop   Older retained champion snapshot.
 ```
 
 The `_0` slot is active during training. It may temporarily contain a full saved candidate population while a GA generation is in progress. After a successful generation, `_0` is pruned back down to the selected parent list.
@@ -259,6 +259,8 @@ _2.._4   single-champion payloads
 ```
 
 When the code needs a single champion from a parent-list file, it uses the first parent in the list. This is deliberate compatibility behavior, not proof that every snapshot file has the same internal format.
+
+Snapshot files use the `.bdpop` format. It is a pickle-free ZIP container with JSON metadata and NumPy `.npy` numeric arrays loaded with `allow_pickle=False`. The trainer and local net-play server do not load `.pkl` models. Use `convert_pkl_to_bdpop.py` once for an old local run, then continue with `.bdpop` snapshots only.
 
 Prelude also follows this layout. It writes `_0` and `_1` as identical parent lists made by cycling through that agent's four assigned prelude seeds. It writes `_2`, `_3`, and `_4` as single champion snapshots.
 
@@ -371,26 +373,119 @@ python -S -m py_compile battledance_training.py
 
 ---
 
-## Files in the repository
+## Browser play and local net play
 
-Main files:
+This repository also includes browser GUIs for trying the game outside the trainer.
+
+For two-human local play, open:
 
 ```text
-battledance_training.py   Game engine and training program.
+battledance_chess_android_gui_v09-bright.html
+```
+
+Despite the filename, it is just a browser HTML GUI. It is aimed at phone/tablet portrait play, but it can also be opened on desktop.
+
+For human-vs-net local play, run the Python server from the project folder:
+
+```bash
+python battledance_net_server.py
+```
+
+Then open the local address printed by the server, or use the included Windows helper:
+
+```text
+start_battledance_vs_net.bat
+```
+
+The net-play server serves:
+
+```text
+battledance_chess_vs_net.html
+```
+
+and lists local `.bdpop` snapshots under:
+
+```text
+models/
+```
+
+The local server is only meant for local play/testing. It is not a public web service.
+
+The browser GUIs currently embed their board and piece images as base64 `data:` URLs inside the HTML files. Base64 is not a security feature; it is only a text encoding for bytes. In this repository it is used for convenience, so the GUIs can stay single-file and do not need separate image fetches. Treat embedded base64 from unknown sources the same way you would treat any other unknown file content.
+
+---
+
+## Converting old `.pkl` snapshots
+
+Old local training runs may have pickle snapshot files. New code should use `.bdpop` snapshots instead.
+
+To convert old local pickle files once:
+
+```bash
+python convert_pkl_to_bdpop.py
+```
+
+That scans `./models/**/*.pkl` and writes sibling `.bdpop` files.
+
+To preview first:
+
+```bash
+python convert_pkl_to_bdpop.py --dry-run
+```
+
+To delete old pickle files after successful conversion:
+
+```bash
+python convert_pkl_to_bdpop.py --delete-pkl
+```
+
+Only run the converter on old pickle files you created locally. Pickle can execute code while loading, so do not convert `.pkl` models received from other people.
+
+---
+
+## Files in the repository
+
+Core Python files:
+
+```text
+battledance_training.py       Game engine and training program.
+battledance_net_server.py     Local browser-vs-net server.
+convert_pkl_to_bdpop.py       One-shot old .pkl -> .bdpop converter.
+```
+
+Browser / launcher files:
+
+```text
+battledance_chess_android_gui_v09-bright.html   Two-human browser GUI.
+battledance_chess_vs_net.html                   Browser GUI for local net play.
+start_battledance_vs_net.bat                    Windows helper to launch the local server.
+```
+
+Configuration and project metadata:
+
+```text
 training_config.ini       Editable defaults for fresh runs.
+requirements.txt          Python dependency list.
 README.md                 This explanation.
 LICENSE                   GPL-3.0-or-later license text.
-requirements.txt          Python dependency list.
 .gitignore                Suggested ignores for generated files.
 ```
 
-Visual reference files:
+Visual reference / source image files:
 
 ```text
-battledance_start_ascii_black_grid.png
-battledance-chess-move-display.png
-concept.png
+battledance-chess-move-display.png      7x7 move-class reference grid.
+battledance_start_ascii_black_grid.png  Text-style starting-position reference.
+concept.png                             Starting two-rank concept image.
+chess_board.png                         Prototype board source image.
+draob_ssehc.png                         Prototype board source image.
+start_battledance_land.png              Start-screen landscape source image.
+start_battledance_port.png              Start-screen portrait source image.
+dnal_ecnadelttab_trats.png              Reversed-name landscape source image.
+trop_ecnadelttab_trats.png              Reversed-name portrait source image.
 ```
+
+Some image filenames are legacy/prototype names. Keep them as-is unless you are also updating any references that expect those names.
 
 Runtime directories are created beside the script:
 
@@ -399,6 +494,23 @@ models/        Model snapshots, training state, rotation state, and logs.
 ga_progress/   Frequently updated progress JSON files.
 sample_games/  Champion game logs and round-robin result matrices.
 ```
+
+Move-history text emitted by the trainer and browser GUIs uses the same compact notation:
+
+```text
+001. Ke2-e4, Ph7xe4, 002. Nf2xe4+ Bd8-c7,
+```
+
+Each move token carries its own ending marker:
+
+```text
+,  quiet move
++  checking move
+#  decisive / terminal move
+=  drawing move
+```
+
+Full-move labels wrap modulo 1000, so `999.` is followed by `000.`. Champion and cycle round-robin headers write results as `+1`, `-1`, or `=0`.
 
 These generated directories can become large and should normally stay out of Git.
 
@@ -411,6 +523,13 @@ sample_games/
 __pycache__/
 *.pyc
 *.tmp.*
+*.pkl
+```
+
+Optional extra belt-and-suspenders entry, if you never want root-level model exports to appear as untracked files:
+
+```gitignore
+*.bdpop
 ```
 
 ---

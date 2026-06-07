@@ -26,8 +26,10 @@ Licensed under GPL-3.0-or-later. See LICENSE.
 import os
 import sys
 import json
-import pickle
+import io
+import zipfile
 import random
+import re
 import hashlib
 import time
 import argparse
@@ -36,7 +38,7 @@ import multiprocessing
 import threading
 import queue
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Sequence
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
 
@@ -1074,9 +1076,142 @@ def _safe_write_json(path: str, obj: object, *, indent: int = 2, durable: bool =
     _atomic_write_bytes(path, payload, durable=durable)
 
 
-def _safe_write_pickle(path: str, obj: object, *, durable: bool = True) -> None:
-    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    _atomic_write_bytes(path, payload, durable=durable)
+BDPOP_MAGIC = "BattledanceBDPOP"
+BDPOP_VERSION = 1
+BDPOP_META_NAME = "bdpop_meta.json"
+
+
+def _bdpop_jsonable_scalar(obj: object) -> Optional[object]:
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return obj
+    if isinstance(obj, np.generic):
+        value = obj.item()
+        if value is None or isinstance(value, (str, bool, int, float)):
+            return value
+    return None
+
+
+def _bdpop_pack_payload(obj: object, arrays: List[np.ndarray]) -> object:
+    scalar = _bdpop_jsonable_scalar(obj)
+    if scalar is not None or obj is None:
+        return scalar
+
+    if isinstance(obj, np.ndarray):
+        arr = np.ascontiguousarray(obj)
+        if arr.dtype.kind == "O":
+            raise TypeError("BDPOP refuses object-dtype arrays.")
+        idx = len(arrays)
+        arrays.append(arr)
+        return {
+            "__bdpop_array__": idx,
+            "dtype": str(arr.dtype),
+            "shape": list(arr.shape),
+        }
+
+    if isinstance(obj, tuple):
+        return [ _bdpop_pack_payload(x, arrays) for x in obj ]
+
+    if isinstance(obj, list):
+        return [ _bdpop_pack_payload(x, arrays) for x in obj ]
+
+    if isinstance(obj, dict):
+        packed: Dict[str, object] = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                k = str(k)
+            packed[k] = _bdpop_pack_payload(v, arrays)
+        return packed
+
+    raise TypeError(f"BDPOP cannot serialize object of type {type(obj).__name__}.")
+
+
+def _bdpop_unpack_payload(obj: object, arrays: Sequence[np.ndarray]) -> object:
+    if isinstance(obj, list):
+        return [_bdpop_unpack_payload(x, arrays) for x in obj]
+
+    if isinstance(obj, dict):
+        if "__bdpop_array__" in obj:
+            try:
+                idx = int(obj["__bdpop_array__"])
+                arr = np.asarray(arrays[idx])
+            except Exception as e:
+                raise ValueError(f"Invalid BDPOP array reference {obj!r}.") from e
+            if arr.dtype.kind == "O":
+                raise ValueError("BDPOP refuses object-dtype arrays.")
+            expected_shape = obj.get("shape")
+            if isinstance(expected_shape, list) and list(arr.shape) != expected_shape:
+                raise ValueError("BDPOP array shape mismatch.")
+            expected_dtype = obj.get("dtype")
+            if isinstance(expected_dtype, str) and str(arr.dtype) != expected_dtype:
+                arr = arr.astype(np.dtype(expected_dtype), copy=False)
+            return np.ascontiguousarray(arr)
+        return {str(k): _bdpop_unpack_payload(v, arrays) for k, v in obj.items()}
+
+    return obj
+
+
+def _write_bdpop_zip(path: str, payload: object, *, durable: bool = True) -> None:
+    """Atomically write a safe, pickle-free .bdpop ZIP payload."""
+    deadline = time.time() + max(0.0, IO_RETRY_SECONDS)
+    attempt = 0
+
+    while True:
+        dirpath = os.path.dirname(path) or "."
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            os.makedirs(dirpath, exist_ok=True)
+
+            arrays: List[np.ndarray] = []
+            packed_payload = _bdpop_pack_payload(payload, arrays)
+            meta = {
+                "format": BDPOP_MAGIC,
+                "version": BDPOP_VERSION,
+                "array_count": len(arrays),
+                "payload": packed_payload,
+            }
+
+            with open(tmp, "wb") as f:
+                with zipfile.ZipFile(f, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                    zf.writestr(BDPOP_META_NAME, json.dumps(meta, separators=(",", ":")))
+                    for idx, arr in enumerate(arrays):
+                        bio = io.BytesIO()
+                        np.save(bio, arr, allow_pickle=False)
+                        zf.writestr(f"arrays/{idx}.npy", bio.getvalue())
+                f.flush()
+                if durable:
+                    os.fsync(f.fileno())
+
+            if os.path.getsize(tmp) <= 0:
+                raise OSError(f"empty temporary BDPOP write for {tmp!r}")
+
+            os.replace(tmp, path)
+            return
+
+        except (OSError, TypeError, ValueError, zipfile.BadZipFile) as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+            if isinstance(e, OSError) and time.time() < deadline:
+                _sleep_io_retry("write", path, e, attempt)
+                attempt += 1
+                continue
+            if isinstance(e, OSError):
+                _request_stop_if_storage_root_still_missing("write", path, e)
+            raise
+
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _safe_write_bdpop_payload(path: str, obj: object, *, durable: bool = True) -> None:
+    _write_bdpop_zip(path, obj, durable=durable)
 
 
 def _safe_write_text(path: str, text: str, *, durable: bool = True) -> None:
@@ -1162,7 +1297,7 @@ def _safe_read_json(path: str) -> Optional[object]:
         except Exception:
             return None
 
-def _safe_read_pickle(path: str) -> Optional[object]:
+def _safe_read_bdpop_payload(path: str) -> Optional[object]:
     if not _path_exists_respecting_transient_storage(path):
         return None
 
@@ -1170,11 +1305,22 @@ def _safe_read_pickle(path: str) -> Optional[object]:
     attempt = 0
     while True:
         try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
-        except (pickle.UnpicklingError, EOFError):
-            # Live file is corrupt.  With backup fallback disabled, caller decides whether
-            # to recreate/restart that progress file.
+            with zipfile.ZipFile(path, "r") as zf:
+                meta = json.loads(zf.read(BDPOP_META_NAME).decode("utf-8"))
+                if not isinstance(meta, dict):
+                    return None
+                if meta.get("format") != BDPOP_MAGIC or int(meta.get("version", -1)) != BDPOP_VERSION:
+                    return None
+                array_count = int(meta.get("array_count", 0) or 0)
+                arrays: List[np.ndarray] = []
+                for idx in range(array_count):
+                    raw = zf.read(f"arrays/{idx}.npy")
+                    arr = np.load(io.BytesIO(raw), allow_pickle=False)
+                    if arr.dtype.kind == "O":
+                        return None
+                    arrays.append(np.ascontiguousarray(arr))
+                return _bdpop_unpack_payload(meta.get("payload"), arrays)
+        except (zipfile.BadZipFile, KeyError, json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, EOFError):
             return None
         except OSError as e:
             if time.time() >= deadline:
@@ -2442,12 +2588,12 @@ def save_parents(parents: List[Agent], filepath: str) -> None:
             "net": agent.net.to_dict(),
         })
     try:
-        _safe_write_pickle(filepath, serial, durable=True)
+        _safe_write_bdpop_payload(filepath, serial, durable=True)
     except Exception:
         pass
 
 def load_parents(filepath: str) -> List[Agent]:
-    data = _safe_read_pickle(filepath)
+    data = _safe_read_bdpop_payload(filepath)
     if not isinstance(data, list):
         return []
 
@@ -2554,7 +2700,7 @@ def save_parents_verified(parents: List[Agent], filepath: str, *, label: str = "
     expected_fingerprint = _parents_fingerprint(parents)
 
     serial = _serialise_parents_payload(parents)
-    _safe_write_pickle(filepath, serial, durable=True)
+    _safe_write_bdpop_payload(filepath, serial, durable=True)
 
     reloaded = load_parents(filepath)
     if len(reloaded) != expected_count or not reloaded:
@@ -2577,7 +2723,7 @@ def save_champion(agent: Agent, filepath: str) -> None:
         "net": agent.net.to_dict(),
     }
     try:
-        _safe_write_pickle(filepath, data, durable=True)
+        _safe_write_bdpop_payload(filepath, data, durable=True)
     except Exception:
         pass
 
@@ -2595,7 +2741,7 @@ def save_champion_verified(agent: Agent, filepath: str, *, label: str = "champio
         "trainable": False,
         "net": agent.net.to_dict(),
     }
-    _safe_write_pickle(filepath, data, durable=True)
+    _safe_write_bdpop_payload(filepath, data, durable=True)
 
     reloaded = load_champion(filepath)
     if reloaded is None:
@@ -2615,7 +2761,7 @@ def save_champion_verified(agent: Agent, filepath: str, *, label: str = "champio
 
 
 def load_champion(filepath: str) -> Optional[Agent]:
-    data = _safe_read_pickle(filepath)
+    data = _safe_read_bdpop_payload(filepath)
     if data is None:
         return None
 
@@ -2640,7 +2786,7 @@ def load_champion(filepath: str) -> Optional[Agent]:
     return None
 
 def save_population_state(name: str, population: List[Agent], gen: int, base_dir: str) -> None:
-    path = os.path.join(base_dir, f"{name}_0.pkl")
+    path = os.path.join(base_dir, f"{name}_0.bdpop")
     expected_count = len(population)
     expected_fingerprint = _population_fingerprint(population)
     serial = {
@@ -2658,7 +2804,7 @@ def save_population_state(name: str, population: List[Agent], gen: int, base_dir
         ],
     }
     try:
-        _safe_write_pickle(path, serial, durable=True)
+        _safe_write_bdpop_payload(path, serial, durable=True)
         reloaded = load_population_state(name, base_dir)
         if reloaded is None:
             raise RuntimeError("reload returned None")
@@ -2673,8 +2819,8 @@ def save_population_state(name: str, population: List[Agent], gen: int, base_dir
         _raise_checkpoint_write_failure("write population state", path, e)
 
 def load_population_state(name: str, base_dir: str) -> Optional[Tuple[List[Agent], int]]:
-    path = os.path.join(base_dir, f"{name}_0.pkl")
-    data = _safe_read_pickle(path)
+    path = os.path.join(base_dir, f"{name}_0.bdpop")
+    data = _safe_read_bdpop_payload(path)
     if not (isinstance(data, dict) and data.get("kind") == "population"):
         return None
 
@@ -3551,6 +3697,160 @@ def train_population_once(
     return new_pop, parents, success
 
 
+
+###############################################################################
+#  Move-history log formatting
+###############################################################################
+
+MOVE_LOG_FULL_MOVES_PER_LINE: int = 4
+MOVE_END_MARKERS = {",", "+", "#", "="}
+
+
+def _result_to_log_text(result: object) -> str:
+    """Return the compact signed result marker used by audit logs."""
+    try:
+        value = int(str(result).strip().lstrip("+"))
+    except Exception:
+        value = 0
+    if value > 0:
+        return "+1"
+    if value < 0:
+        return "-1"
+    return "=0"
+
+
+def _parse_log_result_int(raw: object) -> int:
+    """Parse raw or formatted audit-log results: 1, +1, -1, 0, =0."""
+    text = str(raw).strip()
+    if text.startswith("="):
+        text = text[1:]
+    if text.startswith("+"):
+        text = text[1:]
+    return int(text)
+
+
+def _normalize_result_in_header(header: str) -> str:
+    """Normalize a header's trailing Result field to +1, -1, or =0."""
+    parts = str(header).strip().split()
+    for i, token in enumerate(parts):
+        if token == "Result:" and i + 1 < len(parts):
+            parts[i + 1] = _result_to_log_text(_parse_log_result_int(parts[i + 1]))
+            break
+    return " ".join(parts)
+
+
+def _move_number_label(move_number: int) -> str:
+    """Format wrapped full-move numbers: 999 -> 999., 1000 -> 000., 2016 -> 016."""
+    return f"{int(move_number) % 1000:03d}."
+
+
+def _tokenize_move_history_text(moves_text: str) -> List[str]:
+    """Extract Battledance move tokens while preserving their trailing delimiter."""
+    tokens: List[str] = []
+    for raw in str(moves_text or "").replace("\r", " ").split():
+        token = raw.strip()
+        if not token:
+            continue
+        if token.startswith("```") or token.endswith("```"):
+            token = token.strip("`").strip()
+        if not token:
+            continue
+        if token.endswith(";"):
+            token = token[:-1]
+        if len(token) >= 2 and token.endswith(".") and token[:-1].isdigit():
+            continue
+        if token in ("1-0", "0-1", "1/2-1/2", "+1", "-1", "0", "=0"):
+            continue
+        if ("@" in token) or re.search(r"[a-h][1-8][x-][a-h][1-8]", token, re.IGNORECASE):
+            if token[-1] not in MOVE_END_MARKERS:
+                token += ","
+            tokens.append(token)
+    return tokens
+
+
+def _format_move_history_tokens(tokens: Sequence[str], *, pairs_per_line: int = MOVE_LOG_FULL_MOVES_PER_LINE) -> str:
+    """Format ply tokens as wrapped full-move chunks."""
+    clean_tokens = [str(t).strip() for t in tokens if str(t).strip()]
+    if not clean_tokens:
+        return ""
+
+    chunks: List[str] = []
+    for ply_index in range(0, len(clean_tokens), 2):
+        label = _move_number_label((ply_index // 2) + 1)
+        first = clean_tokens[ply_index]
+        if ply_index + 1 < len(clean_tokens):
+            chunks.append(f"{label} {first} {clean_tokens[ply_index + 1]}")
+        else:
+            chunks.append(f"{label} {first}")
+
+    width = max(1, int(pairs_per_line))
+    lines: List[str] = []
+    for start in range(0, len(chunks), width):
+        lines.append(" ".join(chunks[start:start + width]))
+    return "\n".join(lines)
+
+
+def _format_move_history_text(moves_text: str, *, pairs_per_line: int = MOVE_LOG_FULL_MOVES_PER_LINE) -> str:
+    """Normalize raw or already-numbered move text into canonical audit-log format."""
+    return _format_move_history_tokens(
+        _tokenize_move_history_text(moves_text),
+        pairs_per_line=pairs_per_line,
+    )
+
+
+def _format_game_record_text(header: str, moves_text: str) -> str:
+    """Format one complete game record with a normalized header and move history."""
+    header2 = _normalize_result_in_header(header)
+    moves2 = _format_move_history_text(moves_text)
+    return header2 + ("\n" + moves2 if moves2 else "")
+
+
+def _write_game_records_text(records: Sequence[Tuple[str, str]]) -> str:
+    """Serialize game records with blank lines between records."""
+    if not records:
+        return ""
+    return "\n\n".join(_format_game_record_text(header, moves) for header, moves in records) + "\n"
+
+
+def _read_game_records_by_header(
+    path: str,
+    *,
+    header_predicate,
+) -> List[Tuple[str, str]]:
+    """Read variable-length game records: one header plus one or more move lines."""
+    lines: List[str] = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            lines = []
+
+    records: List[Tuple[str, str]] = []
+    current_header: Optional[str] = None
+    current_moves: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_header, current_moves
+        if current_header is not None:
+            records.append((current_header, " ".join(current_moves).strip()))
+        current_header = None
+        current_moves = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if header_predicate(line):
+            flush()
+            current_header = line
+            current_moves = []
+        elif current_header is not None:
+            current_moves.append(line)
+
+    flush()
+    return records
+
 ###############################################################################
 #  Champion matches and rotation
 ###############################################################################
@@ -3591,7 +3891,7 @@ def _parse_champion_match_header(header: str) -> Optional[Dict[str, object]]:
             "opp": str(fields["Opp"]),
             "snapshot": int(fields["Snapshot"]),
             "champ_color": str(fields["ChampColor"]),
-            "result": int(fields["Result"]),
+            "result": _parse_log_result_int(fields["Result"]),
         }
     except Exception:
         return None
@@ -3630,20 +3930,16 @@ def _champion_match_valid_log_prefix(
     name: str,
     schedule: Sequence[Tuple[str, int, str]],
 ) -> List[Tuple[str, str]]:
-    """Return the longest valid two-line-per-game prefix of a champion log."""
-    lines: List[str] = []
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except Exception:
-            lines = []
+    """Return the longest valid champion-log prefix, accepting raw or formatted move blocks."""
+    parsed_records = _read_game_records_by_header(
+        path,
+        header_predicate=lambda line: line.startswith("Cycle: ") and " Name: " in line and " ChampColor: " in line,
+    )
 
     records: List[Tuple[str, str]] = []
-    i = 0
-    while i + 1 < len(lines) and len(records) < len(schedule):
-        header = lines[i]
-        moves = lines[i + 1]
+    for header, moves in parsed_records:
+        if len(records) >= len(schedule):
+            break
         expected = schedule[len(records)]
         if not _champion_match_header_matches_schedule(
             header,
@@ -3652,14 +3948,12 @@ def _champion_match_valid_log_prefix(
             schedule_entry=expected,
         ):
             break
-        records.append((header, moves))
-        i += 2
+        records.append((_normalize_result_in_header(header), _format_move_history_text(moves)))
     return records
 
 
 def _rewrite_champion_match_log_prefix(path: str, records: Sequence[Tuple[str, str]]) -> None:
-    text = "".join(f"{header}\n{moves}\n" for header, moves in records)
-    _safe_write_text(path, text, durable=True)
+    _safe_write_text(path, _write_game_records_text(records), durable=True)
 
 
 def _champion_match_log_complete_for_agent(
@@ -3705,7 +3999,7 @@ def run_champion_matches(
 
     for opp_name in opponent_lists.get(name, []):
         for s in TRAINING_SNAPSHOT_INDICES:
-            opp_path = os.path.join(base_dir, f"{opp_name}_{s}.pkl")
+            opp_path = os.path.join(base_dir, f"{opp_name}_{s}.bdpop")
             if not _path_exists_respecting_transient_storage(opp_path):
                 problems.append(f"missing {opp_name}_{s} at {opp_path!r}")
                 continue
@@ -3780,10 +4074,10 @@ def run_champion_matches(
 
         header = (
             f"Cycle: {cycle} Name: {name} Opp: {opp_name} "
-            f"Snapshot: {s} ChampColor: {color} Result: {result}"
+            f"Snapshot: {s} ChampColor: {color} Result: {_result_to_log_text(result)}"
         )
         try:
-            _append_text_with_retry(outfile_path, header + "\n" + moves_str + "\n", durable=True)
+            _append_text_with_retry(outfile_path, _format_game_record_text(header, moves_str) + "\n\n", durable=True)
         except Exception as e:
             _raise_checkpoint_write_failure("append champion match log", outfile_path, e)
 
@@ -3807,9 +4101,11 @@ def play_game_with_moves(agent1: Agent, agent2: Agent, env: BattledanceEnvironme
        0 = draw
 
     moves_str:
-      fixed-width chunks: "<move><mark><space>"
-        mark: ',' normal, '+' gives check, '#' ends game (bishop capture OR mate-by-no-legal-move)
-              '=' draw
+      canonical numbered move-history text, e.g.
+        001. Ke2-e4, Ph7xe4, 002. Nf2xe4+ Bd8-c7,
+
+      Markers are part of each move token:
+        ',' quiet, '+' check, '#' terminal win, '=' draw
     """
     board = env.initial_board.copy()
     players = {'w': agent1, 'b': agent2}
@@ -3874,7 +4170,8 @@ def play_game_with_moves(agent1: Agent, agent2: Agent, env: BattledanceEnvironme
             result = 0
             break
 
-    moves_str = "".join(f"{m}{k} " for m, k in zip(moves_list, marks_after))
+    move_tokens = [f"{m}{k}" for m, k in zip(moves_list, marks_after)]
+    moves_str = _format_move_history_tokens(move_tokens)
     return result, moves_str
 
 ###############################################################################
@@ -3894,7 +4191,7 @@ def _load_required_opponent_snapshot_champions(
 
     for opp_name in opponent_lists.get(name, []):
         for s in TRAINING_SNAPSHOT_INDICES:
-            path = os.path.join(base_dir, f"{opp_name}_{s}.pkl")
+            path = os.path.join(base_dir, f"{opp_name}_{s}.bdpop")
             if not _path_exists_respecting_transient_storage(path):
                 problems.append(f"missing {opp_name}_{s} at {path!r}")
                 continue
@@ -3941,7 +4238,7 @@ def train_single_agent(
       * resumes GA from a saved population if available,
       * otherwise seeds from existing canonical parents,
       * trains until a parent set passes,
-      * saves parents to Name_0.pkl,
+      * saves parents to Name_0.bdpop,
       * resets GA progress for this agent,
       * writes a GA 'done' marker so later resumes can skip GA entirely.
 
@@ -3959,7 +4256,7 @@ def train_single_agent(
     done_state = load_ga_done_state(base_dir, name)
     if done_state is not None and done_state.get("cycle") == cycle:
         # Only trust the marker if the parents snapshot still exists.
-        pop_path = os.path.join(base_dir, f"{name}_0.pkl")
+        pop_path = os.path.join(base_dir, f"{name}_0.bdpop")
         parents_existing = load_parents(pop_path)
         if len(parents_existing) == PARENT_COUNT:
             last_gen = int(done_state.get("last_gen", 0) or 0)
@@ -3996,8 +4293,8 @@ def train_single_agent(
     else:
         # No population snapshot: seed new GA population from parents in `_0` or `_1`,
         # and refuses to invent fresh parents inside an initialized run.
-        parent_path0 = os.path.join(base_dir, f"{name}_0.pkl")
-        parent_path1 = os.path.join(base_dir, f"{name}_1.pkl")
+        parent_path0 = os.path.join(base_dir, f"{name}_0.bdpop")
+        parent_path1 = os.path.join(base_dir, f"{name}_1.bdpop")
 
         seed_parents = load_parents(parent_path0)
         source_path = parent_path0
@@ -4071,13 +4368,13 @@ def train_single_agent(
     log(f"[{name}] cycle {cycle}: finished after {gen} generations.")
 
     # At success: prune `_0` down to the 8 selected parents for this cycle.
-    pop_path = os.path.join(base_dir, f"{name}_0.pkl")
+    pop_path = os.path.join(base_dir, f"{name}_0.bdpop")
     save_parents_verified(parents, pop_path, label=f"{name}_0 cycle {cycle} parents")
     log(f"[{name}] cycle {cycle}: parents saved and verified to {pop_path}")
 
     # Mark GA as done for this agent and cycle before clearing per-game GA
     # progress. If a crash lands in this narrow window, resume can trust the
-    # verified Name_0.pkl parent list and skip needless retraining.
+    # verified Name_0.bdpop parent list and skip needless retraining.
     save_ga_done_state(base_dir, name, cycle, gen)
 
     # Clear GA progress for this agent now that the generation is complete.
@@ -4125,26 +4422,26 @@ def train_group_agent_sequence(
     try:
         for name in group_names:
             check_stop(stop_event)
-    
+
             seed = name_to_seed.get(name, 0)
-    
-            # Train this agent until GA success; saves parents to Name_0.pkl
+
+            # Train this agent until GA success; saves parents to Name_0.bdpop
             train_single_agent(name, opponent_lists, base_dir, cycle, seed, env=env, stop_event=stop_event)
-    
+
             check_stop(stop_event)
-    
-            # Load parents (8 nets) from Name_0.pkl for champion matches
-            pop_path = os.path.join(base_dir, f"{name}_0.pkl")
+
+            # Load parents (8 nets) from Name_0.bdpop for champion matches
+            pop_path = os.path.join(base_dir, f"{name}_0.bdpop")
             parents = load_parents(pop_path)
             if len(parents) != PARENT_COUNT:
                 raise RuntimeError(
                     f"[{name}] cycle {cycle}: expected {PARENT_COUNT} loadable parents after GA success at {pop_path!r}; "
                     f"loaded {len(parents)}. Refusing to mark agent done without champion matches."
                 )
-    
+
             # Per-agent champion match log
             champ_log_path = _sample_game_path(base_dir, f"champion_matches_{name}.txt")
-    
+
             # Run champion matches immediately after training this agent
             run_champion_matches(
                 name,
@@ -4161,8 +4458,8 @@ def train_group_agent_sequence(
         log("[global] Graceful stop: worker exiting cleanly.")
         status_newline()
         return
-    
-    
+
+
 ###############################################################################
 #  Main training loop and rotation
 ###############################################################################
@@ -4182,7 +4479,7 @@ def _find_done_agents_with_invalid_outputs(
         entry = agents_progress.get(sname, {})
         if entry.get("state") != "done":
             continue
-        path = os.path.join(base_dir, f"{sname}_0.pkl")
+        path = os.path.join(base_dir, f"{sname}_0.bdpop")
         if len(load_parents(path)) != PARENT_COUNT:
             invalid[sname] = "done_state_but_missing_or_wrong_parent_count"
             continue
@@ -4284,7 +4581,7 @@ def run_training_cycle(
             agents_to_train.append(name)
 
     # Hardened resume validation: a "done" cycle-progress entry is only
-    # trusted if the corresponding Name_0.pkl parent snapshot still reloads.
+    # trusted if the corresponding Name_0.bdpop parent snapshot still reloads.
     # Otherwise the agent is put back into pending state and retrained instead
     # of letting rotation fail later from a missing/corrupt _0 file.
     invalid_done_agents = _find_done_agents_with_invalid_outputs(
@@ -4557,7 +4854,7 @@ def _cycle_rotation_plan_path(base_dir: str, cycle: int, name: str) -> str:
     If rotation is interrupted, reruns reapply the saved payloads instead of
     re-reading already-shifted _1/_2/_3 files and accidentally rotating twice.
     """
-    return os.path.join(base_dir, f"cycle_{int(cycle)}_rotation_plan_{name}.pkl")
+    return os.path.join(base_dir, f"cycle_{int(cycle)}_rotation_plan_{name}.bdpop")
 
 
 def _cycle_rotation_plan_paths(base_dir: str, cycle: int, agent_names: Sequence[str]) -> List[str]:
@@ -4585,7 +4882,7 @@ def _serialise_parents_payload(parents: Sequence[Agent]) -> List[Dict[str, objec
 
 def _snapshot_paths_for_agent(base_dir: str, name: str) -> Dict[int, str]:
     return {
-        s: os.path.join(base_dir, f"{name}_{s}.pkl")
+        s: os.path.join(base_dir, f"{name}_{s}.bdpop")
         for s in (0,) + SNAPSHOT_INDICES
     }
 
@@ -4624,9 +4921,11 @@ def _load_optional_rotation_champion(path: str, *, name: str, snap: int) -> Opti
     return champ
 
 
-def _write_pickle_payload_verified(path: str, payload: object) -> None:
-    raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-    _atomic_write_bytes(path, raw, durable=True)
+def _write_bdpop_payload_verified(path: str, payload: object) -> None:
+    _safe_write_bdpop_payload(path, payload, durable=True)
+    reread = _safe_read_bdpop_payload(path)
+    if reread is None:
+        raise RuntimeError(f"BDPOP payload at {path!r} did not reload after writing.")
 
 
 def _remove_path_with_retry(path: str) -> None:
@@ -4720,7 +5019,7 @@ def _load_or_create_rotation_agent_plan(
     plan_path = _cycle_rotation_plan_path(base_dir, cycle, name)
 
     if _path_exists_respecting_transient_storage(plan_path):
-        data = _safe_read_pickle(plan_path)
+        data = _safe_read_bdpop_payload(plan_path)
         if _valid_rotation_agent_plan(data, cycle=cycle, name=name, agent_names=agent_names):
             return data  # type: ignore[return-value]
         raise RotationError(
@@ -4734,10 +5033,10 @@ def _load_or_create_rotation_agent_plan(
         base_dir=base_dir,
         cycle=cycle,
     )
-    _safe_write_pickle(plan_path, plan, durable=True)
+    _safe_write_bdpop_payload(plan_path, plan, durable=True)
 
     # Prove the plan is readable before we touch overlapping destinations.
-    reread = _safe_read_pickle(plan_path)
+    reread = _safe_read_bdpop_payload(plan_path)
     if not _valid_rotation_agent_plan(reread, cycle=cycle, name=name, agent_names=agent_names):
         raise RotationError(f"[{name}] rotation plan could not be verified after writing {plan_path!r}.")
     return reread  # type: ignore[return-value]
@@ -4764,7 +5063,7 @@ def _apply_rotation_agent_plan(
             if payload is None:
                 _remove_path_with_retry(path)
             else:
-                _write_pickle_payload_verified(path, payload)
+                _write_bdpop_payload_verified(path, payload)
         except Exception as e:
             raise RotationError(f"[{name}] rotation write failed for _{snap} at {path!r}: {e!r}") from e
 
@@ -5040,13 +5339,13 @@ def _cycle_champions_rr_matrix_path(base_dir: str, cycle: int) -> str:
 
 def _rotation_done_snapshots_valid(agent_names: Sequence[str], base_dir: str) -> bool:
     for name in agent_names:
-        p1 = os.path.join(base_dir, f"{name}_1.pkl")
+        p1 = os.path.join(base_dir, f"{name}_1.bdpop")
         if len(load_parents(p1)) != PARENT_COUNT:
             return False
         for snap in SNAPSHOT_INDICES:
             if int(snap) == 1:
                 continue
-            path = os.path.join(base_dir, f"{name}_{int(snap)}.pkl")
+            path = os.path.join(base_dir, f"{name}_{int(snap)}.bdpop")
             if load_champion(path) is None:
                 return False
     return True
@@ -5388,7 +5687,7 @@ def _cycle_rr_parse_log_result(header: str) -> int:
     for i, token in enumerate(parts):
         if token == "Result:" and i + 1 < len(parts):
             try:
-                return int(parts[i + 1])
+                return _parse_log_result_int(parts[i + 1])
             except Exception:
                 break
     raise ValueError(f"Could not parse cycle RR result from header: {header!r}")
@@ -5396,32 +5695,20 @@ def _cycle_rr_parse_log_result(header: str) -> int:
 
 def _cycle_rr_read_worker_log_records(path: str) -> List[Tuple[int, int, str, str]]:
     """Return complete worker-log records as (global_index, result, header, moves)."""
-    lines: List[str] = []
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except Exception:
-            lines = []
+    parsed_records = _read_game_records_by_header(
+        path,
+        header_predicate=lambda line: line.startswith("Cycle: ") and " Index: " in line,
+    )
 
     records: List[Tuple[int, int, str, str]] = []
-    i = 0
-    while i + 1 < len(lines):
-        header = lines[i]
-        if header.startswith("Cycle: ") and " Index: " in header:
-            try:
-                idx = _cycle_rr_parse_log_index(header)
-                result = _cycle_rr_parse_log_result(header)
-                records.append((idx, result, header, lines[i + 1]))
-            except Exception:
-                # Stop at the first malformed complete-looking record; the
-                # tail will be truncated and replayed.
-                break
-            i += 2
-        else:
-            # Ignore stray lines before/between valid records, but do not let
-            # them count as completed games.
-            i += 1
+    for header, moves in parsed_records:
+        try:
+            idx = _cycle_rr_parse_log_index(header)
+            result = _cycle_rr_parse_log_result(header)
+            records.append((idx, result, _normalize_result_in_header(header), _format_move_history_text(moves)))
+        except Exception:
+            # Stop at the first malformed complete-looking record; the tail will be truncated and replayed.
+            break
     return records
 
 
@@ -5515,31 +5802,11 @@ def _cycle_rr_truncate_worker_log(path: str, keep_games: int) -> None:
             pass
         return
 
-    lines: List[str] = []
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except Exception:
-            lines = []
-
-    games: List[Tuple[str, str]] = []
-    i = 0
-    while i + 1 < len(lines):
-        line = lines[i]
-        if line.startswith("Cycle: ") and " Index: " in line:
-            games.append((line, lines[i + 1]))
-            i += 2
-        else:
-            i += 1
-
-    trimmed: List[str] = []
-    for header, moves in games[:int(keep_games)]:
-        trimmed.append(header)
-        trimmed.append(moves)
+    games = _cycle_rr_read_worker_log_records(path)
+    kept_records = [(header, moves) for _idx, _result, header, moves in games[:int(keep_games)]]
 
     try:
-        _safe_write_text(path, ("\n".join(trimmed) + "\n") if trimmed else "", durable=True)
+        _safe_write_text(path, _write_game_records_text(kept_records), durable=True)
     except Exception:
         pass
 
@@ -5578,7 +5845,7 @@ def _cycle_rr_check_stop(
 def _load_cycle_rr_champions(agent_names: Sequence[str], base_dir: str) -> List[Agent]:
     champions: List[Agent] = []
     for name in agent_names:
-        path = os.path.join(base_dir, f"{name}_1.pkl")
+        path = os.path.join(base_dir, f"{name}_1.bdpop")
         champ = load_champion(path)
         if champ is None:
             parents = load_parents(path)
@@ -5690,12 +5957,12 @@ def _cycle_rr_worker_row_block(
 
             header = (
                 f"Cycle: {int(cycle)} Index: {int(global_index)} Rep: {int(rep) + 1} "
-                f"White: {white_name} Black: {black_name} Result: {result}"
+                f"White: {white_name} Black: {black_name} Result: {_result_to_log_text(result)}"
             )
             # The move log is part of the durable result of this pass.
             # Do not advance progress unless this append succeeds.
             try:
-                _append_text_with_retry(log_path, header + "\n" + moves_str + "\n", durable=True)
+                _append_text_with_retry(log_path, _format_game_record_text(header, moves_str) + "\n\n", durable=True)
             except Exception as e:
                 _request_stop_if_storage_root_still_missing("append cycle RR worker log", log_path, e)
                 if _PERSISTENT_STORAGE_LOSS_DETECTED:
@@ -5839,7 +6106,7 @@ def _cycle_rr_parse_header_fields(header: str) -> Optional[Dict[str, object]]:
             "rep": int(fields["Rep"]),
             "white": str(fields["White"]),
             "black": str(fields["Black"]),
-            "result": int(fields["Result"]),
+            "result": _parse_log_result_int(fields["Result"]),
         }
     except Exception:
         return None
@@ -5924,23 +6191,8 @@ def _cycle_rr_final_outputs_valid(
     if not os.path.exists(moves_path) or not os.path.exists(matrix_path):
         return False
 
-    try:
-        with open(moves_path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except Exception:
-        return False
-
     n = len(agent_names)
-    records: List[Tuple[int, int, str, str]] = []
-    i = 0
-    while i + 1 < len(lines):
-        header = lines[i]
-        moves = lines[i + 1]
-        parsed = _cycle_rr_parse_header_fields(header)
-        if parsed is None:
-            return False
-        records.append((int(parsed["index"]), int(parsed["result"]), header, moves))
-        i += 2
+    records = _cycle_rr_read_worker_log_records(moves_path)
     if len(records) != expected_games:
         return False
 
@@ -5980,17 +6232,8 @@ def _cycle_rr_finalize_outputs(
                     lines = f.read().splitlines()
             except Exception:
                 lines = []
-        i = 0
-        while i + 1 < len(lines):
-            header = lines[i]
-            if header.startswith("Cycle: ") and " Index: " in header:
-                parsed = _cycle_rr_parse_header_fields(header)
-                if parsed is None:
-                    break
-                records.append((int(parsed["index"]), header, lines[i + 1]))
-                i += 2
-            else:
-                i += 1
+        for idx, _result, header, moves in _cycle_rr_read_worker_log_records(path):
+            records.append((int(idx), header, moves))
 
     records.sort(key=lambda x: x[0])
     expected_games = int(reps) * len(agent_names) * len(agent_names)
@@ -6022,7 +6265,7 @@ def _cycle_rr_finalize_outputs(
     matrix = matrix_from_logs
 
     moves_path = _cycle_champions_rr_moves_path(base_dir, cycle)
-    moves_text = "".join(f"{header}\n{moves}\n" for _, header, moves in records)
+    moves_text = _write_game_records_text([(header, moves) for _, header, moves in records])
     _safe_write_text(moves_path, moves_text, durable=True)
 
     matrix_path = _cycle_champions_rr_matrix_path(base_dir, cycle)
@@ -7309,15 +7552,15 @@ def _save_prelude_assignment(
                 clone.trainable = False
                 parents.append(clone)
 
-        save_parents_verified(parents, os.path.join(base_dir, f"{label}_0.pkl"), label=f"{label}_0 prelude parents")
-        save_parents_verified(parents, os.path.join(base_dir, f"{label}_1.pkl"), label=f"{label}_1 prelude parents")
+        save_parents_verified(parents, os.path.join(base_dir, f"{label}_0.bdpop"), label=f"{label}_0 prelude parents")
+        save_parents_verified(parents, os.path.join(base_dir, f"{label}_1.bdpop"), label=f"{label}_1 prelude parents")
 
         for snap in SNAPSHOT_INDICES:
             if int(snap) == 1:
                 continue
             save_champion_verified(
                 snapshot_agents[int(snap)],
-                os.path.join(base_dir, f"{label}_{int(snap)}.pkl"),
+                os.path.join(base_dir, f"{label}_{int(snap)}.bdpop"),
                 label=f"{label}_{int(snap)} prelude champion",
             )
 
@@ -7344,11 +7587,11 @@ def _save_prelude_assignment(
     log("[prelude] snake assignment saved to configured snapshots.")
 
 def _existing_snapshot_files(agent_names: Sequence[str], base_dir: str) -> List[str]:
-    """Return existing <Name>_<0..4>.pkl snapshot files in models/."""
+    """Return existing <Name>_<0..4>.bdpop snapshot files in models/."""
     found: List[str] = []
     for name in agent_names:
         for snap in (0,) + SNAPSHOT_INDICES:
-            path = os.path.join(base_dir, f"{name}_{snap}.pkl")
+            path = os.path.join(base_dir, f"{name}_{snap}.bdpop")
             if _path_exists_respecting_transient_storage(path):
                 found.append(path)
     return found
