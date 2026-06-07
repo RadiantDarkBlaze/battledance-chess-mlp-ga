@@ -225,6 +225,8 @@ A cycle roughly does this:
 6. Optionally run a cycle-end champion round-robin.
 7. Advance the cycle counter.
 
+The optional cycle-end champion round-robin writes the full game log, a white-perspective margin matrix, one representative game per directed matchup cell, a human-readable report, and a summary JSON file. Representative games prefer the modal result class; if the modal result is tied, Black win is preferred over White win, and White win is preferred over draw. A draw is selected only when it is strictly the modal result.
+
 If the program stops before the cycle counter advances, running it again resumes the unfinished work instead of treating the cycle as complete.
 
 ---
@@ -492,7 +494,8 @@ Runtime directories are created beside the script:
 ```text
 models/        Model snapshots, training state, rotation state, and logs.
 ga_progress/   Frequently updated progress JSON files.
-sample_games/  Champion game logs and round-robin result matrices.
+sample_games/  Champion game logs, cycle round-robin logs, matrices,
+               representative games, reports, and summary JSON files.
 ```
 
 Move-history text emitted by the trainer and browser GUIs uses the same compact notation:
