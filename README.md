@@ -225,8 +225,6 @@ A cycle roughly does this:
 6. Optionally run a cycle-end champion round-robin.
 7. Advance the cycle counter.
 
-The optional cycle-end champion round-robin writes the full game log, a white-perspective margin matrix, one representative game per directed matchup cell, a human-readable report, and a summary JSON file. Representative games prefer the modal result class; if the modal result is tied, Black win is preferred over White win, and White win is preferred over draw. A draw is selected only when it is strictly the modal result.
-
 If the program stops before the cycle counter advances, running it again resumes the unfinished work instead of treating the cycle as complete.
 
 ---
@@ -413,7 +411,7 @@ models/
 
 The local server is only meant for local play/testing. It is not a public web service.
 
-The browser GUIs currently embed their board and piece images as base64 `data:` URLs inside the HTML files. Base64 is not a security feature; it is only a text encoding for bytes. In this repository it is used for convenience, so the GUIs can stay single-file and do not need separate image fetches. Treat embedded base64 from unknown sources the same way you would treat any other unknown file content.
+The browser GUIs load their board and piece images from `assets/battledance_gui/`. Older single-file GUI builds embedded those PNG bytes as base64 `data:` URLs, but the current layout keeps the images as ordinary `.png` files instead. Base64 is not a security feature; it is only a text encoding for bytes. Treat unknown encoded assets or unknown image files the same way you would treat any other unknown file content.
 
 ---
 
@@ -494,8 +492,7 @@ Runtime directories are created beside the script:
 ```text
 models/        Model snapshots, training state, rotation state, and logs.
 ga_progress/   Frequently updated progress JSON files.
-sample_games/  Champion game logs, cycle round-robin logs, matrices,
-               representative games, reports, and summary JSON files.
+sample_games/  Champion game logs and round-robin result matrices.
 ```
 
 Move-history text emitted by the trainer and browser GUIs uses the same compact notation:
