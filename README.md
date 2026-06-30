@@ -227,6 +227,16 @@ A cycle roughly does this:
 
 If the program stops before the cycle counter advances, running it again resumes the unfinished work instead of treating the cycle as complete.
 
+### Worker groups and cycle-end round robin
+
+`--threads-mode` resolves through `[threads]` in `training_config.ini`.
+
+Named thread modes are treated as fixed agent ownership groups for ordinary training, per-agent champion audit work, and the post-rotation cycle-end champion round-robin.
+
+For the cycle-end champion round-robin, each worker owns its configured agents as White and plays those White champions against every Black champion. Matrix/report output still uses `[agents].names` order, but worker ownership follows the resolved `[threads]` groups rather than simple contiguous matrix-row chunks.
+
+The prelude is the exception. Prelude ranks anonymous seed networks, so it uses `[prelude] workers` to split seed rows instead of using the named agent thread groups.
+
 ---
 
 ## Agents and snapshots
@@ -461,6 +471,14 @@ battledance_chess_vs_net.html                   Browser GUI for local net play.
 start_battledance_vs_net.bat                    Windows helper to launch the local server.
 ```
 
+GUI asset files:
+
+```text
+assets/battledance_gui/boards/        Board images used by the browser GUIs.
+assets/battledance_gui/board_pieces/  Board-piece sprites used by the browser GUIs.
+assets/battledance_gui/hand_pieces/   In-hand piece sprites used by the browser GUIs.
+```
+
 Configuration and project metadata:
 
 ```text
@@ -523,6 +541,17 @@ sample_games/
 __pycache__/
 *.pyc
 *.tmp.*
+
+# Runtime spillover / older-layout generated files.
+training_log.txt
+ga_progress_*.json
+champion_progress_*.json
+prelude_progress*.json
+cycle_*_champions_rr*.txt
+cycle_*_champions_rr*.json
+cycle_*_matrix.txt
+
+# Legacy unsafe model snapshots; convert to .bdpop instead.
 *.pkl
 ```
 
@@ -596,7 +625,7 @@ io_retry_max_delay = 5.0
 Usually safe between resumes:
 
 ```text
-thread mode
+thread mode, except while a phase-specific worker sidecar is actively incomplete
 I/O retry timing
 prelude worker count, while still in prelude
 ```
