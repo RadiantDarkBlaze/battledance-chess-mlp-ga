@@ -4,7 +4,15 @@ sample_games/
 __pycache__/
 *.pyc
 *.tmp.*
-*.bdpop
+
+# Runtime spillover / older-layout generated files.
+training_log.txt
+ga_progress_*.json
+champion_progress_*.json
+prelude_progress*.json
+cycle_*_champions_rr*.txt
+cycle_*_champions_rr*.json
+cycle_*_matrix.txt
 
 # Legacy unsafe model snapshots; convert to .bdpop instead.
 *.pkl
