@@ -423,6 +423,40 @@ def status(msg: str) -> None:
     _last_status_len = len(line)
 
 
+def _terminate_alive_processes(
+    processes: Sequence[multiprocessing.Process],
+    *,
+    terminate_timeout: float = 5.0,
+    kill_timeout: float = 2.0,
+) -> None:
+    """Best-effort cleanup for sibling workers after one worker fails."""
+    for p in processes:
+        try:
+            if p.is_alive():
+                p.terminate()
+        except Exception:
+            pass
+
+    for p in processes:
+        try:
+            p.join(timeout=terminate_timeout)
+        except Exception:
+            pass
+
+    for p in processes:
+        try:
+            if p.is_alive() and hasattr(p, "kill"):
+                p.kill()
+        except Exception:
+            pass
+
+    for p in processes:
+        try:
+            p.join(timeout=kill_timeout)
+        except Exception:
+            pass
+
+
 def _collect_worker_results_or_raise(
     *,
     processes: Sequence[multiprocessing.Process],
@@ -461,6 +495,7 @@ def _collect_worker_results_or_raise(
 
         if bad:
             states = ", ".join(f"{p.name}:exit={p.exitcode}" for p in processes)
+            _terminate_alive_processes(processes)
             raise RuntimeError(
                 f"{context}: worker process ended before posting all result messages "
                 f"({len(results)}/{expected_count}); process states: {states}"
@@ -4411,6 +4446,7 @@ def train_group_agent_sequence(
     """
     # Redirect status + logging to the main process before any output.
     init_ipc(status_queue, log_queue)
+    _apply_training_config_for_process()
     if stop_event is not None:
         _set_active_stop_event(stop_event)
     _seed_process_move_randomness(f"train_group:{cycle}:{','.join(group_names)}")
@@ -4840,6 +4876,15 @@ class RotationError(Exception):
     pass
 
 
+def _rotation_snapshot_indices() -> List[int]:
+    snaps = [int(s) for s in SNAPSHOT_INDICES]
+    if not snaps or snaps[0] != 1:
+        raise RotationError(
+            "Snapshot rotation requires kept nonzero snapshots to include _1 as the first slot."
+        )
+    return snaps
+
+
 def _cycle_rotation_plan_path(base_dir: str, cycle: int, name: str) -> str:
     """Per-agent idempotent rotation plan path.
 
@@ -4876,7 +4921,7 @@ def _serialise_parents_payload(parents: Sequence[Agent]) -> List[Dict[str, objec
 def _snapshot_paths_for_agent(base_dir: str, name: str) -> Dict[int, str]:
     return {
         s: os.path.join(base_dir, f"{name}_{s}.bdpop")
-        for s in (0,) + SNAPSHOT_INDICES
+        for s in (0,) + tuple(int(x) for x in SNAPSHOT_INDICES)
     }
 
 
@@ -4943,17 +4988,20 @@ def _valid_rotation_agent_plan(data: object, *, cycle: int, name: str, agent_nam
     payloads = data.get("payloads")
     if not isinstance(payloads, dict):
         return False
+    try:
+        snaps = _rotation_snapshot_indices()
+    except RotationError:
+        return False
+    keys = [str(s) for s in snaps]
     return (
         data.get("kind") == "cycle_rotation_agent_plan"
         and data.get("cycle") == int(cycle)
         and data.get("agent") == str(name)
         and data.get("agent_names_sha1") == _cycle_rr_names_sha1(agent_names)
-        and "1" in payloads
-        and "2" in payloads
-        and "3" in payloads
-        and "4" in payloads
-        and isinstance(payloads.get("1"), list)
-        and isinstance(payloads.get("2"), dict)
+        and data.get("snapshot_indices") == snaps
+        and all(k in payloads for k in keys)
+        and isinstance(payloads.get(keys[0]), list)
+        and all(payloads.get(k) is None or isinstance(payloads.get(k), dict) for k in keys[1:])
     )
 
 
@@ -4965,37 +5013,36 @@ def _build_rotation_agent_plan(
     cycle: int,
 ) -> Dict[str, object]:
     paths = _snapshot_paths_for_agent(base_dir, name)
+    snaps = _rotation_snapshot_indices()
 
     # Read all sources before touching any destination.  This captures the
     # intended old snapshot state so the plan can be reapplied idempotently.
     parents_0 = _load_required_rotation_parents(paths[0], name=name, snap=0)
-    champ_1 = _load_required_rotation_champion(paths[1], name=name, snap=1)
-    champ_2 = _load_optional_rotation_champion(paths[2], name=name, snap=2)
-    champ_3 = _load_optional_rotation_champion(paths[3], name=name, snap=3)
-
     payloads: Dict[str, object] = {
-        # Destination _1 receives current _0 parents.
-        "1": _serialise_parents_payload(parents_0),
-        # Destination _2 receives old _1 champion.
-        "2": _serialise_champion_payload(champ_1),
-        # Destination _3 receives old _2 champion, or is removed if absent.
-        "3": _serialise_champion_payload(champ_2) if champ_2 is not None else None,
-        # Destination _4 receives old _3 champion, or is removed if absent.
-        "4": _serialise_champion_payload(champ_3) if champ_3 is not None else None,
+        str(snaps[0]): _serialise_parents_payload(parents_0),
     }
 
-    fingerprints = {
-        "1": _parents_payload_fingerprint(payloads["1"]),
-        "2": _champion_payload_fingerprint(payloads["2"]),
-        "3": _champion_payload_fingerprint(payloads["3"]),
-        "4": _champion_payload_fingerprint(payloads["4"]),
-    }
+    for src_snap, dest_snap in zip(snaps, snaps[1:]):
+        if int(src_snap) == 1:
+            champ = _load_required_rotation_champion(paths[int(src_snap)], name=name, snap=int(src_snap))
+        else:
+            champ = _load_optional_rotation_champion(paths[int(src_snap)], name=name, snap=int(src_snap))
+        payloads[str(dest_snap)] = _serialise_champion_payload(champ) if champ is not None else None
+
+    fingerprints: Dict[str, object] = {}
+    for idx, snap in enumerate(snaps):
+        key = str(snap)
+        if idx == 0:
+            fingerprints[key] = _parents_payload_fingerprint(payloads[key])
+        else:
+            fingerprints[key] = _champion_payload_fingerprint(payloads[key])
 
     return {
         "kind": "cycle_rotation_agent_plan",
         "cycle": int(cycle),
         "agent": str(name),
         "agent_names_sha1": _cycle_rr_names_sha1(agent_names),
+        "snapshot_indices": snaps,
         "payloads": payloads,
         "fingerprints": fingerprints,
         "timestamp_created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
@@ -5043,13 +5090,14 @@ def _apply_rotation_agent_plan(
     plan: Dict[str, object],
 ) -> None:
     paths = _snapshot_paths_for_agent(base_dir, name)
+    snaps = _rotation_snapshot_indices()
     payloads = plan.get("payloads")
     if not isinstance(payloads, dict):
         raise RotationError(f"[{name}] rotation plan has no payloads.")
 
-    # Apply old-history destinations first, then _2, then _1.  Since payloads
+    # Apply old-history destinations first, then the newest slot. Since payloads
     # come from the saved plan, this is idempotent across crashes.
-    for snap in (4, 3, 2, 1):
+    for snap in reversed(snaps):
         payload = payloads.get(str(snap))
         path = paths[snap]
         try:
@@ -5068,6 +5116,7 @@ def _verify_rotation_agent_destinations(
     plan: Dict[str, object],
 ) -> None:
     paths = _snapshot_paths_for_agent(base_dir, name)
+    snaps = _rotation_snapshot_indices()
     payloads = plan.get("payloads")
     if not isinstance(payloads, dict):
         raise RotationError(f"[{name}] rotation plan has no payloads for verification.")
@@ -5076,21 +5125,24 @@ def _verify_rotation_agent_destinations(
     if not isinstance(fingerprints, dict):
         fingerprints = {}
 
-    # _1 must reload as the exact planned parent list, not merely any list.
-    p1 = payloads.get("1")
-    expected_p1_fp = fingerprints.get("1") or _parents_payload_fingerprint(p1)
-    parents_1 = load_parents(paths[1])
+    # The newest retained snapshot must reload as the exact planned parent list,
+    # not merely any list.
+    first_snap = snaps[0]
+    first_key = str(first_snap)
+    p1 = payloads.get(first_key)
+    expected_p1_fp = fingerprints.get(first_key) or _parents_payload_fingerprint(p1)
+    parents_1 = load_parents(paths[first_snap])
     if not isinstance(p1, list) or len(parents_1) != len(p1) or not parents_1:
         raise RotationError(
-            f"[{name}] rotation verification failed: _1 at {paths[1]!r} did not reload as the planned parent list."
+            f"[{name}] rotation verification failed: _{first_snap} at {paths[first_snap]!r} did not reload as the planned parent list."
         )
     if expected_p1_fp is None or _parents_fingerprint(parents_1) != expected_p1_fp:
         raise RotationError(
-            f"[{name}] rotation verification failed: _1 at {paths[1]!r} reloaded, but parent fingerprint differs from plan."
+            f"[{name}] rotation verification failed: _{first_snap} at {paths[first_snap]!r} reloaded, but parent fingerprint differs from plan."
         )
 
-    # _2/_3/_4 reload if planned, otherwise confirm absent.
-    for snap in (2, 3, 4):
+    # Older configured snapshots reload if planned, otherwise confirm absent.
+    for snap in snaps[1:]:
         payload = payloads.get(str(snap))
         expected_fp = fingerprints.get(str(snap)) or _champion_payload_fingerprint(payload)
         path = paths[snap]
@@ -5177,14 +5229,20 @@ def _rotation_plan_summary_for_agent(plan: Dict[str, object]) -> Dict[str, objec
     if not isinstance(payloads, dict):
         payloads = {}
 
+    snaps = _rotation_snapshot_indices()
+    destinations: Dict[str, object] = {}
+    if snaps:
+        destinations[f"_{snaps[0]}"] = _rotation_parents_summary(payloads.get(str(snaps[0])), source="_0")
+        for src_snap, dest_snap in zip(snaps, snaps[1:]):
+            destinations[f"_{dest_snap}"] = _rotation_champion_summary(
+                payloads.get(str(dest_snap)),
+                source=f"_{src_snap}",
+            )
+
     return {
         "plan_timestamp_created": plan.get("timestamp_created"),
-        "destinations": {
-            "_1": _rotation_parents_summary(payloads.get("1"), source="_0"),
-            "_2": _rotation_champion_summary(payloads.get("2"), source="_1"),
-            "_3": _rotation_champion_summary(payloads.get("3"), source="_2"),
-            "_4": _rotation_champion_summary(payloads.get("4"), source="_3"),
-        },
+        "snapshot_indices": snaps,
+        "destinations": destinations,
     }
 
 
@@ -5253,7 +5311,9 @@ def safe_rotate_snapshots_verified(agent_names: List[str], base_dir: str, cycle:
         })
         agents_summary[str(name)] = agent_summary
 
-        log(f"[{name}] rotation: verified planned _0→_1, _1→_2, _2→_3, _3→_4.", also_print=False)
+        snaps = _rotation_snapshot_indices()
+        steps = [f"_0->_{snaps[0]}"] + [f"_{src}->_{dest}" for src, dest in zip(snaps, snaps[1:])]
+        log(f"[{name}] rotation: verified planned {', '.join(steps)}.", also_print=False)
 
     finished = time.time()
     result["timestamp_verified"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(finished))
@@ -5343,13 +5403,15 @@ def _cycle_champions_rr_summary_json_path(base_dir: str, cycle: int) -> str:
 
 
 def _rotation_done_snapshots_valid(agent_names: Sequence[str], base_dir: str) -> bool:
+    try:
+        snaps = _rotation_snapshot_indices()
+    except RotationError:
+        return False
     for name in agent_names:
-        p1 = os.path.join(base_dir, f"{name}_1.bdpop")
+        p1 = os.path.join(base_dir, f"{name}_{snaps[0]}.bdpop")
         if len(load_parents(p1)) != PARENT_COUNT:
             return False
-        for snap in SNAPSHOT_INDICES:
-            if int(snap) == 1:
-                continue
+        for snap in snaps[1:]:
             path = os.path.join(base_dir, f"{name}_{int(snap)}.bdpop")
             if load_champion(path) is None:
                 return False
@@ -5949,9 +6011,10 @@ def _cycle_rr_worker_row_block(
         _set_active_stop_event(stop_event)
     rows = [int(x) for x in white_indices]
     rows_label = _cycle_rr_rows_label(rows, agent_names)
-    _seed_process_move_randomness(f"cycle_rr:{cycle}:{worker_id}:{','.join(str(x) for x in rows)}")
     progress: Dict[str, object] = {}
     try:
+        _apply_training_config_for_process()
+        _seed_process_move_randomness(f"cycle_rr:{cycle}:{worker_id}:{','.join(str(x) for x in rows)}")
         env = BattledanceEnvironment()
         champions = _load_cycle_rr_champions(agent_names, base_dir)
         n = len(champions)
@@ -7516,6 +7579,7 @@ def _prelude_worker_row_block(
     if stop_event is not None:
         _set_active_stop_event(stop_event)
     try:
+        _apply_training_config_for_process()
         _seed_process_move_randomness(f"prelude:{worker_id}:{row_start}:{row_end}")
 
         env = BattledanceEnvironment()
@@ -8158,6 +8222,10 @@ class TrainingConfig:
     hidden_layers: Tuple[int, ...]
 
 
+def _training_config_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_config.ini")
+
+
 def _split_csv(value: object) -> List[str]:
     text = str(value or "").strip()
     if not text:
@@ -8261,6 +8329,10 @@ def _parse_snapshot_indices(raw_kept: object, raw_training: object) -> Tuple[Tup
     else:
         kept = (1, 2, 3, 4)
     kept = tuple(sorted(dict.fromkeys(x for x in kept if x >= 1))) or (1,)
+    if 1 not in kept:
+        raise ValueError(
+            "[snapshots] kept_nonzero_snapshots must include 1 because _1 is the newest retained snapshot."
+        )
     training_s = str(raw_training or "").strip()
     training = tuple(int(x) for x in _split_csv(training_s)) if training_s else kept
     training = tuple(x for x in sorted(dict.fromkeys(training)) if x in set(kept)) or (kept[0],)
@@ -8378,6 +8450,16 @@ def _load_training_config(path: str) -> TrainingConfig:
     return cfg
 
 
+def _apply_training_config_for_process() -> TrainingConfig:
+    """Load the repo-local config in spawned worker processes too.
+
+    Windows multiprocessing uses spawn, so workers import this module with the
+    built-in defaults.  Reloading the same config in each worker keeps exposed
+    training_config.ini knobs functional in multi-process modes.
+    """
+    return _load_training_config(_training_config_path())
+
+
 def _resolve_thread_mode_groups(thread_mode: Optional[str], config: TrainingConfig) -> Tuple[str, List[List[str]]]:
     mode = str(thread_mode or config.default_threads_mode or "1")
     if mode in config.thread_modes:
@@ -8440,7 +8522,7 @@ def initialize_agents(
         raise RuntimeError(f"Initial training_state.json write verification failed at {state_path!r}.")
 
 def main() -> None:
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_config.ini")
+    config_path = _training_config_path()
     config = _load_training_config(config_path)
 
     parser = argparse.ArgumentParser(description="Battledance Chess training driver")
